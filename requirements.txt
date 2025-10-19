@@ -1,3 +1,4 @@
 PyQt6>=6.5
 pyqtgraph>=0.13
+numpy>=1.23
 mcculw>=1.0

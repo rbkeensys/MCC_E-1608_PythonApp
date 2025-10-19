@@ -1,29 +1,127 @@
 {
-"board": 0,
-"sampleRateHz": 1000,
-"blockSize": 256,
-"analogs": [
-{ "cutoffHz": 0.1, "name": "Tank Level", "offset": 0.0, "slope": 10.0, "units": "%" },
-{ "cutoffHz": 1.0, "name": "Pressure", "offset": -2.0,"slope": 5.0, "units": "psi" },
-{ "cutoffHz": 2.0, "name": "Temp", "offset": 0.0, "slope": 10.0, "units": "°C" },
-{ "cutoffHz": 3.0, "name": "Flow", "offset": 0.0, "slope": 2.0, "units": "L/m" },
-{ "cutoffHz": 1.0, "name": "Volt", "offset": 0.0, "slope": 1.0, "units": "V" },
-{ "cutoffHz": 1.0, "name": "Volt", "offset": 0.0, "slope": 1.0, "units": "V" },
-{ "cutoffHz": 1.0, "name": "Volt", "offset": 0.0, "slope": 1.0, "units": "V" },
-{ "cutoffHz": 1.0, "name": "Volt", "offset": 0.0, "slope": 1.0, "units": "V" }
-],
-"digitalOutputs": [
-    { "name": "Pump A",  "normallyClosed": false, "mode": "toggle", "actuationTime": 1.0 },
-    { "name": "Pump B",  "normallyClosed": false, "mode": "toggle", "actuationTime": 2.0 },
-    { "name": "Valve 1", "normallyClosed": false, "mode": "toggle", "actuationTime": 0.2 },
-    { "name": "Valve 2", "normallyClosed": false, "mode": "toggle", "actuationTime": 0.0 },
-    { "name": "Heater",  "normallyClosed": false, "mode": "toggle", "actuationTime": 0.0 },
-    { "name": "Chiller", "normallyClosed": false, "mode": "toggle", "actuationTime": 0.0 },
-    { "name": "Light",   "normallyClosed": false, "mode": "toggle", "actuationTime": 0.0 },
-    { "name": "Fan",     "normallyClosed": false, "mode": "toggle", "actuationTime": 0.0 }
-],
- "analogOutputs": [
-   { "ValvePos A": "Command 0", "minV": 0.0, "maxV": 10.0, "startupV": 0.0 },
-   { "TBD":        "Command 1", "minV": -10.0, "maxV": 10.0, "startupV": 0.0 }
- ]
+  "boardNum": 0,
+  "sampleRateHz": 1000.0,
+  "blockSize": 128,
+  "analogs": [
+    {
+      "name": "AI",
+      "slope": 1.0,
+      "offset": 0.0,
+      "cutoffHz": 0.0,
+      "units": ""
+    },
+    {
+      "name": "AI",
+      "slope": 1.0,
+      "offset": 0.0,
+      "cutoffHz": 0.0,
+      "units": ""
+    },
+    {
+      "name": "AI",
+      "slope": 1.0,
+      "offset": 0.0,
+      "cutoffHz": 0.0,
+      "units": ""
+    },
+    {
+      "name": "AI",
+      "slope": 1.0,
+      "offset": 0.0,
+      "cutoffHz": 0.0,
+      "units": ""
+    },
+    {
+      "name": "AI",
+      "slope": 1.0,
+      "offset": 0.0,
+      "cutoffHz": 0.0,
+      "units": ""
+    },
+    {
+      "name": "AI",
+      "slope": 1.0,
+      "offset": 0.0,
+      "cutoffHz": 0.0,
+      "units": ""
+    },
+    {
+      "name": "AI",
+      "slope": 1.0,
+      "offset": 0.0,
+      "cutoffHz": 0.0,
+      "units": ""
+    },
+    {
+      "name": "AI",
+      "slope": 1.0,
+      "offset": 0.0,
+      "cutoffHz": 0.0,
+      "units": ""
+    }
+  ],
+  "digitalOutputs": [
+    {
+      "name": "DO",
+      "normallyOpen": false,
+      "momentary": false,
+      "actuationTime": 0.0
+    },
+    {
+      "name": "DO",
+      "normallyOpen": true,
+      "momentary": false,
+      "actuationTime": 0.0
+    },
+    {
+      "name": "DO",
+      "normallyOpen": true,
+      "momentary": false,
+      "actuationTime": 0.0
+    },
+    {
+      "name": "DO",
+      "normallyOpen": true,
+      "momentary": false,
+      "actuationTime": 0.0
+    },
+    {
+      "name": "DO",
+      "normallyOpen": true,
+      "momentary": false,
+      "actuationTime": 0.0
+    },
+    {
+      "name": "DO",
+      "normallyOpen": true,
+      "momentary": false,
+      "actuationTime": 0.0
+    },
+    {
+      "name": "DO",
+      "normallyOpen": true,
+      "momentary": false,
+      "actuationTime": 0.0
+    },
+    {
+      "name": "DO",
+      "normallyOpen": true,
+      "momentary": false,
+      "actuationTime": 0.0
+    }
+  ],
+  "analogOutputs": [
+    {
+      "name": "AO0",
+      "minV": 0.0,
+      "maxV": 10.0,
+      "startupV": 0.0
+    },
+    {
+      "name": "AO1",
+      "minV": 0.0,
+      "maxV": 10.0,
+      "startupV": 0.0
+    }
+  ]
 }
