@@ -1,4 +1,3 @@
-
 import math
 class OnePoleLPF:
     def __init__(self, cutoff_hz: float, fs_hz: float):

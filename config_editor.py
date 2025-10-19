@@ -1,4 +1,3 @@
-
 from PyQt6 import QtCore, QtWidgets
 from config_manager import AppConfig, AnalogCfg, DigitalOutCfg, AnalogOutCfg
 
@@ -16,11 +15,8 @@ class ConfigEditorDialog(QtWidgets.QDialog):
         self.sp_board = QtWidgets.QSpinBox(); self.sp_board.setRange(0, 31); self.sp_board.setValue(cfg.boardNum)
         self.sp_rate = QtWidgets.QDoubleSpinBox(); self.sp_rate.setRange(0.1, 200000.0); self.sp_rate.setDecimals(3); self.sp_rate.setValue(cfg.sampleRateHz)
         self.sp_block = QtWidgets.QSpinBox(); self.sp_block.setRange(1, 65536); self.sp_block.setValue(cfg.blockSize)
-        self.cmb_mode = QtWidgets.QComboBox()
-        self.cmb_mode.addItems(["SE (8 channels)", "DIFF (4 channels)"])
-        self.cmb_mode.setCurrentIndex(0 if (cfg.aiMode.upper().startswith("SE")) else 1)
-        gform.addRow("Analog Input Mode", self.cmb_mode)
-        gform.addRow("Board #", self.sp_board); gform.addRow("Sample Rate (Hz)", self.sp_rate); gform.addRow("Block Size", self.sp_block)
+        self.cmb_mode = QtWidgets.QComboBox(); self.cmb_mode.addItems(["SE (8 channels)", "DIFF (4 channels)"]); self.cmb_mode.setCurrentIndex(0 if cfg.aiMode.upper().startswith("SE") else 1)
+        gform.addRow("Board #", self.sp_board); gform.addRow("Sample Rate (Hz)", self.sp_rate); gform.addRow("Block Size", self.sp_block); gform.addRow("Analog Input Mode", self.cmb_mode)
         tabs.addTab(gen, "General")
 
         aiw = QtWidgets.QWidget(); vbox = QtWidgets.QVBoxLayout(aiw)
@@ -64,6 +60,7 @@ class ConfigEditorDialog(QtWidgets.QDialog):
         cfg.boardNum = int(self.sp_board.value())
         cfg.sampleRateHz = float(self.sp_rate.value())
         cfg.blockSize = int(self.sp_block.value())
+        cfg.aiMode = "SE" if self.cmb_mode.currentIndex() == 0 else "DIFF"
         for i in range(8):
             name = self.tbl_ai.item(i, 0).text() if self.tbl_ai.item(i, 0) else f"AI{i}"
             slope = float(self.tbl_ai.item(i, 1).text()) if self.tbl_ai.item(i, 1) else 1.0
@@ -83,6 +80,4 @@ class ConfigEditorDialog(QtWidgets.QDialog):
             maxv = float(self.tbl_ao.item(i, 2).text()) if self.tbl_ao.item(i, 2) else 10.0
             st = float(self.tbl_ao.item(i, 3).text()) if self.tbl_ao.item(i, 3) else 0.0
             cfg.analogOutputs[i] = AnalogOutCfg(name=name, minV=minv, maxV=maxv, startupV=st)
-
-        cfg.aiMode = "SE" if self.cmb_mode.currentIndex() == 0 else "DIFF"
         return cfg

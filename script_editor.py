@@ -1,4 +1,3 @@
-
 from PyQt6 import QtCore, QtWidgets
 
 class ScriptEditorDialog(QtWidgets.QDialog):
@@ -40,7 +39,7 @@ class ScriptEditorDialog(QtWidgets.QDialog):
             self.table.setItem(r, 1+c, it)
 
     def _on_add(self): self._append_row(0.0, [False]*8)
-    def _on_del(self): 
+    def _on_del(self):
         rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
         for r in rows: self.table.removeRow(r)
     def _on_sort(self): self.table.sortItems(0, QtCore.Qt.SortOrder.AscendingOrder)
