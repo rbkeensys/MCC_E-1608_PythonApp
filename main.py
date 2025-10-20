@@ -1,4 +1,8 @@
 import sys, json
+import math
+import time
+import numpy as np
+
 from PyQt6 import QtCore, QtWidgets
 from config_manager import ConfigManager, AppConfig
 from daq_driver import DaqDriver, DaqError
@@ -11,6 +15,7 @@ from script_editor import ScriptEditorDialog
 from collections import deque
 from acq_worker import AcqWorker
 from combined_chart import CombinedChartWindow
+from bisect import bisect_left
 
 class ScaleDialog(QtWidgets.QDialog):
     def __init__(self, parent, idx, y_min, y_max):
@@ -18,25 +23,43 @@ class ScaleDialog(QtWidgets.QDialog):
         self.setWindowTitle(f"Scale AI{idx}")
         self.setModal(True)
         form = QtWidgets.QFormLayout(self)
-        self.chk_auto = QtWidgets.QCheckBox("Auto-scale");
-        self.chk_auto.setChecked(False);
+        self.chk_auto = QtWidgets.QCheckBox("Auto-scale")
+        self.chk_auto.setChecked(False)
         form.addRow(self.chk_auto)
 
         def mk(v):
             sp = QtWidgets.QDoubleSpinBox()
-            sp.setRange(-1e12, 1e12); sp.setDecimals(6); sp.setSingleStep(0.1)
-            sp.setKeyboardTracking(True); sp.setAccelerated(False)
+            sp.setRange(-1e12, 1e12)
+            sp.setDecimals(6)
+            sp.setSingleStep(0.1)
+            sp.setKeyboardTracking(True)
+            sp.setAccelerated(False)
             sp.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.UpDownArrows)
-            sp.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus); sp.lineEdit().setReadOnly(False); sp.setValue(float(v)); return sp
-        self.sp_min = mk(y_min); self.sp_max = mk(y_max); form.addRow("Y min", self.sp_min); form.addRow("Y max", self.sp_max)
+            sp.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+            sp.lineEdit().setReadOnly(False)
+            sp.setValue(float(v))
+            return sp
+
+        self.sp_min = mk(y_min)
+        self.sp_max = mk(y_max)
+        form.addRow("Y min", self.sp_min)
+        form.addRow("Y max", self.sp_max)
         btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
-        btns.accepted.connect(self.accept); btns.rejected.connect(self.reject); form.addRow(btns)
-        self.chk_auto.toggled.connect(self._on_auto); self._on_auto(self.chk_auto.isChecked())
-    def _on_auto(self, checked: bool): self.sp_min.setDisabled(checked); self.sp_max.setDisabled(checked)
-    def result_values(self): return self.chk_auto.isChecked(), self.sp_min.value(), self.sp_max.value()
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        form.addRow(btns)
+        self.chk_auto.toggled.connect(self._on_auto)
+        self._on_auto(self.chk_auto.isChecked())
+
+    def _on_auto(self, checked: bool):
+        self.sp_min.setDisabled(checked)
+        self.sp_max.setDisabled(checked)
+
+    def result_values(self):
+        return self.chk_auto.isChecked(), self.sp_min.value(), self.sp_max.value()
+
 
 class MainWindow(QtWidgets.QMainWindow):
-
     def __init__(self):
         super().__init__()
         self.setWindowTitle("MCC E-1608 Control")
@@ -53,7 +76,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.time_window_s = 5.0
         self.ui_rate_hz = 50.0
         self.sample_period = 1.0 / max(1e-6, self.cfg.sampleRateHz)
+        self._history_headroom = 1.25  # 25% margin
+        self._rebuild_histories_for_span()  # NEW: create deques sized for current span & sample rate
         self.script_events = []
+
+        self.do_state = [False] * 8  # <-- add: current DO state for plotting
 
         # Windows
         self.analog_win = AnalogChartWindow(
@@ -129,6 +156,64 @@ class MainWindow(QtWidgets.QMainWindow):
             return float(v) if v is not None else fallback
         self.ao_value = [_ao_default(0, 0.0), _ao_default(1, 0.0)]
 
+        # hook up span sync from both windows (after you create the windows)
+        self.analog_win.spanChanged.connect(self._on_span_changed)
+        self.combined_win.spanChanged.connect(self._on_span_changed)
+
+        # also push the current span into both windows once
+        self.analog_win.set_span(self.time_window_s)
+        self.combined_win.set_span(self.time_window_s)
+
+    def _effective_rate_hz(self) -> float:
+        # prefer actual; fall back to requested
+        try:
+            return 1.0 / float(self.sample_period) if self.sample_period > 0 else float(self.cfg.sampleRateHz)
+        except Exception:
+            return float(getattr(self.cfg, "sampleRateHz", 1000.0))
+
+    def _target_history_len(self, span_s: float) -> int:
+        rate = max(1.0, self._effective_rate_hz())
+        return int(math.ceil(rate * float(span_s) * self._history_headroom))
+
+    def _rebuild_histories_for_span(self):
+        """Ensure histories can hold the full span at current rate (with headroom)."""
+        cap = max(256, self._target_history_len(self.time_window_s))
+
+        # rebuild as deques while preserving tail
+        def redq(seq, maxlen):
+            if isinstance(seq, deque):
+                data = list(seq)
+            else:
+                data = list(seq)
+            return deque(data[-maxlen:], maxlen=maxlen)
+
+        # X history
+        self.ai_hist_x = redq(getattr(self, "ai_hist_x", []), cap)
+
+        # AI
+        self.ai_hist_y = [redq(ch, cap) for ch in getattr(self, "ai_hist_y", [[] for _ in range(8)])]
+
+        # DO
+        self.do_hist_y = [redq(ch, cap) for ch in getattr(self, "do_hist_y", [[] for _ in range(8)])]
+
+        # AO (if you track them)
+        self.ao_hist_y = [redq(ch, cap) for ch in getattr(self, "ao_hist_y", [[] for _ in range(2)])]
+
+    def _on_span_changed(self, seconds: float):
+        """User changed X-span in either window: sync both + ensure buffers can hold it."""
+        self.time_window_s = float(seconds)
+        # sync spinboxes without feedback
+        if hasattr(self, "analog_win"):   self.analog_win.set_span(self.time_window_s)
+        if hasattr(self, "combined_win"): self.combined_win.set_span(self.time_window_s)
+
+        # (optional) if you have a span control on the main page, update it too:
+        # if hasattr(self, "sp_timewin"):
+        #     self.sp_timewin.blockSignals(True)
+        #     self.sp_timewin.setValue(self.time_window_s)
+        #     self.sp_timewin.blockSignals(False)
+
+        # Make sure histories are large enough for the new span
+        self._rebuild_histories_for_span()
 
     def _build_menu(self):
         m=self.menuBar(); f=m.addMenu("&File")
@@ -281,6 +366,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 0, high, float(self.cfg.sampleRateHz), int(self.cfg.blockSize)
             )
             self.sample_period = 1.0 / max(1e-6, float(actual_rate))
+            self._rebuild_histories_for_span()
 
             # 6) Restart background acquisition worker (if your app uses it)
             try:
@@ -342,6 +428,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg=ConfigEditorDialog(self,self.cfg)
         if dlg.exec():
             self.cfg=dlg.updated_config(); self.sample_period = 1.0 / max(1e-6, self.cfg.sampleRateHz); self._apply_cfg_to_ui()
+            self._rebuild_histories_for_span()
 
     def _act_load_script(self):
         path,_=QtWidgets.QFileDialog.getOpenFileName(self,"Load script.json","","JSON (*.json)")
@@ -393,6 +480,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # Start hardware scan
             actual_rate = self.daq.start_ai_scan(0, high, self.cfg.sampleRateHz, self.cfg.blockSize)
             self.sample_period = 1.0 / max(1e-6, float(actual_rate))
+            self._rebuild_histories_for_span()
 
             # Start background acquisition worker (does calibration + LPF)
             slopes = [a.slope for a in self.cfg.analogs]
@@ -442,7 +530,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _apply_ao_slider(self, idx):
         self._on_ao_slider(idx, self.ao_sliders[idx].value())
-        self.ao_value[idx] = self.ao_sliders[idx].value()
+        #self.ao_value[idx] = self.ao_sliders[idx].value()
 
     def _on_do_pressed(self, idx):
         if self.do_chk_mom[idx].isChecked():
@@ -471,6 +559,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.daq and getattr(self.daq,"connected",False): self._set_do(idx, False if no else True)
 
     def _set_do(self, idx, state: bool):
+        self.do_state[idx] = bool(state)  # <-- remember for plotting
         if self.daq and getattr(self.daq,"connected",False):
             try: self.daq.set_do_bit(idx, state)
             except Exception as e: self.log_rx(f"DO error: {e}")
@@ -480,59 +569,124 @@ class MainWindow(QtWidgets.QMainWindow):
             blk=self.do_btns[i].blockSignals(True); self.do_btns[i].setChecked(bool(st)); self.do_btns[i].blockSignals(blk)
 
     def _render(self):
-        self._ensure_queue()
+        try:
+            # Skip rendering until we’re connected and actually have samples
+            if not (self.daq and getattr(self.daq, "connected", False)):
+                return
 
-        # Drain all queued chunks
-        while self._chunk_queue:
-            pkt = self._chunk_queue.popleft()
-            low = int(pkt["low"]);
-            num_ch = int(pkt["num_ch"]);
-            M = int(pkt["M"])
-            data = pkt["data"]  # shape (num_ch, M), already calibrated + filtered
+            # Snapshot histories as lists
+            x_list = list(self.ai_hist_x)
+            if not hasattr(self, "_x0") or self._x0 is None or (x_list and x_list[0] < self._x0): self._x0 = float(x_list[0])
+            if not x_list:
+                return
 
-            # Extend X
-            start = (self.ai_hist_x[-1] + self.sample_period) if self.ai_hist_x else 0.0
-            self.ai_hist_x.extend([start + k * self.sample_period for k in range(M)])
+            ai_list = [list(ch) for ch in self.ai_hist_y]  # 8
+            do_list = [list(ch) for ch in self.do_hist_y]  # 8
+            ao_list = [list(ch) for ch in getattr(self, "ao_hist_y", [[], []])]  # 2
 
-            present = set(range(low, low + num_ch))
+            # Window by time span
+            span = float(self.time_window_s)
+            t_end = x_list[-1]
+            t_start = t_end - span
+            i0 = bisect_left(x_list, t_start)
+            x_cut = x_list[i0:]
+            if not x_cut:
+                return
+            N = len(x_cut)
+
+            def cut_align(seq, fill=0.0):
+                out = seq[i0:]
+                if len(out) < N:
+                    out = [fill] * (N - len(out)) + out
+                elif len(out) > N:
+                    out = out[-N:]
+                return out
+
+            ys_cut = [cut_align(ch, fill=np.nan) for ch in ai_list]
+            do_cut = [cut_align(ch, fill=0.0) for ch in do_list]
+
+            ao_vals = getattr(self, "ao_value", [0.0, 0.0])
+            ao_cut = []
+            for idx, ch in enumerate(ao_list[:2]):
+                fillv = float(ao_vals[idx]) if idx < len(ao_vals) else 0.0
+                ao_cut.append(cut_align(ch, fill=fillv))
+
+            x_arr = np.asarray(x_cut, dtype=float)
+            if x_arr.size:
+                x_arr = np.asarray(x_cut, dtype=float) - float(self._x0)
+
+            if hasattr(self, "analog_win") and self.analog_win.isVisible():
+                self.analog_win.set_data(x_arr, ys_cut)
+            if hasattr(self, "digital_win") and self.digital_win.isVisible():
+                self.digital_win.set_data(x_arr, do_cut)
+            if hasattr(self, "combined_win") and self.combined_win.isVisible():
+                self.combined_win.set_data(x_arr, ys_cut, ao_cut, do_cut)
+
+        except Exception as e:
+            if self.daq and getattr(self.daq, "connected", False):
+                self.log_rx(f"Render error: {e}")
+
+    def _drain_chunks(self, max_batches: int = 8):
+        """Pop up to max_batches blocks from the acq queue and append to histories.
+
+        X is a relative time axis that starts at 0.0 for the first sample and
+        advances by the current sample period (self.sample_period).
+        """
+        if not hasattr(self, "_chunk_queue") or not self._chunk_queue:
+            return
+
+        sp = float(self.sample_period if self.sample_period > 0 else 1.0 / max(1.0, self.cfg.sampleRateHz))
+        last_x = float(self.ai_hist_x[-1]) if len(self.ai_hist_x) > 0 else None
+
+        batches = 0
+        while self._chunk_queue and batches < max_batches:
+            payload = self._chunk_queue.popleft()
+            batches += 1
+
+            data = payload.get("data", None)
+            if data is None:
+                continue
+
+            arr = np.asarray(data, dtype=float)
+            if arr.ndim == 1:
+                arr = arr.reshape(1, -1)
+            num_ch, M = int(arr.shape[0]), int(arr.shape[1])
+
+            # Build relative X for this block
+            start = 0.0 if (last_x is None) else (last_x + sp)
+            x_block = start + np.arange(M, dtype=float) * sp
+            last_x = float(x_block[-1])
+
+            # Append to histories
+            self.ai_hist_x.extend(x_block.tolist())
+
+            # AI channels; if fewer channels scanned, pad remaining with NaNs
             for ch in range(8):
-                if ch in present:
-                    self.ai_hist_y[ch].extend(data[ch - low, :].tolist())
+                if ch < num_ch:
+                    self.ai_hist_y[ch].extend(arr[ch, :].tolist())
                 else:
-                    self.ai_hist_y[ch].extend([float('nan')] * M)
+                    self.ai_hist_y[ch].extend([np.nan] * M)
 
-        # Keep history bounded to window + small slack
-        self._prune_history()
+            # DO: repeat current state across this block
+            for di in range(8):
+                self.do_hist_y[di].extend([1.0 if self.do_state[di] else 0.0] * M)
 
-        # Skip a frame while dragging to keep it smooth
-        if QtWidgets.QApplication.mouseButtons() != QtCore.Qt.MouseButton.NoButton:
-            return
-        if not self.ai_hist_x:
-            return
-
-        x_cut, ys_cut = self._tail_by_time(self.ai_hist_x, self.ai_hist_y, self.time_window_s)
-        self.analog_win.set_data(x_cut, ys_cut)
-
-        # Digital chart aligned to same X
-        do_states = [1 if self.do_btns[i].isChecked() else 0 for i in range(8)]
-        for i in range(8):
-            need = len(self.ai_hist_x) - len(self.do_hist_y[i])
-            if need > 0:
-                self.do_hist_y[i].extend([do_states[i]] * need)
-        _, do_cut = self._tail_by_time(self.ai_hist_x, self.do_hist_y, self.time_window_s)
-
-        # Ensure AO histories match AI history length (repeat current value)
-        for i in range(2):
-            need = len(self.ai_hist_x) - len(self.ao_hist_y[i])
-            if need > 0:
-                self.ao_hist_y[i].extend([self.ao_value[i]] * need)
-        _, ao_cut = self._tail_by_time(self.ai_hist_x, self.ao_hist_y, self.time_window_s)
-
-        self.digital_win.set_data(x_cut, do_cut)
-        self.combined_win.set_data(x_cut, ys_cut, ao_cut, do_cut)
+            # AO: repeat current AO volts across this block
+            for ai in range(2):
+                val = float(self.ao_value[ai]) if hasattr(self, "ao_value") else 0.0
+                self.ao_hist_y[ai].extend([val] * M)
 
     def _loop(self):
-        self._prune_history()
+        self._drain_chunks(max_batches=8)
+        #self._prune_history()
+
+    def _reset_histories(self):
+        """Clear and (re)size histories to fit the current span & rate; X restarts at 0.0."""
+        cap = max(256, self._target_history_len(getattr(self, "time_window_s", 5.0)))
+        self.ai_hist_x = deque(maxlen=cap)
+        self.ai_hist_y = [deque(maxlen=cap) for _ in range(8)]
+        self.do_hist_y = [deque(maxlen=cap) for _ in range(8)]
+        self.ao_hist_y = [deque(maxlen=cap) for _ in range(2)]
 
     def _prune_history(self):
         max_pts=int(max(1.0, self.cfg.sampleRateHz)*12.0)

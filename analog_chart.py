@@ -5,6 +5,7 @@ import numpy as np
 class AnalogChartWindow(QtWidgets.QMainWindow):
     traceClicked = QtCore.pyqtSignal(int)
     requestScale = QtCore.pyqtSignal(int)
+    spanChanged = QtCore.pyqtSignal(float)   # <— NEW
 
     def __init__(self, names, units):
         super().__init__()
@@ -17,6 +18,21 @@ class AnalogChartWindow(QtWidgets.QMainWindow):
         outer = QtWidgets.QVBoxLayout(cw)
         outer.setContentsMargins(6,6,6,6)
         outer.setSpacing(6)
+
+        # --- NEW: X-span control bar ---
+        ctrl = QtWidgets.QWidget()
+        hl = QtWidgets.QHBoxLayout(ctrl)
+        hl.setContentsMargins(0,0,0,0); hl.setSpacing(8)
+        hl.addWidget(QtWidgets.QLabel("X span (s):"))
+        self.sp_span = QtWidgets.QDoubleSpinBox()
+        self.sp_span.setRange(0.01, 100.0)      # request: up to 100 s (tweak as you like)
+        self.sp_span.setDecimals(3)
+        self.sp_span.setSingleStep(0.01)
+        self.sp_span.setValue(5.0)              # default; MainWindow will overwrite on init
+        self.sp_span.valueChanged.connect(lambda v: self.spanChanged.emit(float(v)))
+        hl.addWidget(self.sp_span)
+        hl.addStretch(1)
+        outer.addWidget(ctrl)
 
         self.plots = []
         self.curves = []
@@ -114,7 +130,13 @@ class AnalogChartWindow(QtWidgets.QMainWindow):
             self.curves.append(curve)
             self._headers.append((chk_auto, sp_min, sp_max, btn_apply, lbl_chan))
 
+
     # --- header helpers ---
+    def set_span(self, seconds: float):
+        self.sp_span.blockSignals(True)
+        self.sp_span.setValue(float(seconds))
+        self.sp_span.blockSignals(False)
+
     def _on_auto_toggled(self, idx: int, checked: bool):
         self._y_locked[idx] = not checked
         sp_min = self._headers[idx][1]
