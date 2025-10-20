@@ -93,10 +93,17 @@ class MainWindow(QtWidgets.QMainWindow):
         rgl.addWidget(QtWidgets.QLabel("Time window (s)"),4,0)
         self.time_spin=QtWidgets.QDoubleSpinBox(); self.time_spin.setRange(0.01,10.0); self.time_spin.setDecimals(3); self.time_spin.setSingleStep(0.01); self.time_spin.setValue(self.time_window_s)
         self.time_spin.valueChanged.connect(self._on_time_window); rgl.addWidget(self.time_spin,4,1)
-        self.btn_connect=QtWidgets.QPushButton("Connect"); self.btn_connect.clicked.connect(self._act_connect); rgl.addWidget(self.btn_connect,5,0)
-        self.btn_run=QtWidgets.QPushButton("Run Script"); self.btn_run.clicked.connect(self._act_run_script); rgl.addWidget(self.btn_run,6,0)
-        self.btn_stop=QtWidgets.QPushButton("Stop/Pause Script"); self.btn_stop.clicked.connect(self._act_stop_script); rgl.addWidget(self.btn_stop,6,1)
-        self.btn_reset=QtWidgets.QPushButton("Reset Script"); self.btn_reset.clicked.connect(self._act_reset_script); rgl.addWidget(self.btn_reset,7,0)
+        self.btn_connect=QtWidgets.QPushButton("Connect")
+        self.btn_connect.clicked.connect(self._act_connect); rgl.addWidget(self.btn_connect,5,0)
+        self.btn_apply_cfg = QtWidgets.QPushButton("Apply Config")
+        self.btn_apply_cfg.setToolTip("Re-apply the current config to the UI and device")
+        self.btn_apply_cfg.clicked.connect(self._act_apply_config); rgl.addWidget(self.btn_apply_cfg,5,1)
+        self.btn_run=QtWidgets.QPushButton("Run Script")
+        self.btn_run.clicked.connect(self._act_run_script); rgl.addWidget(self.btn_run,6,0)
+        self.btn_stop=QtWidgets.QPushButton("Stop/Pause Script")
+        self.btn_stop.clicked.connect(self._act_stop_script); rgl.addWidget(self.btn_stop,6,1)
+        self.btn_reset=QtWidgets.QPushButton("Reset Script")
+        self.btn_reset.clicked.connect(self._act_reset_script); rgl.addWidget(self.btn_reset,7,0)
 
     def _build_status_panes(self):
         tx=QtWidgets.QDockWidget("Sent (Tx)", self); rx=QtWidgets.QDockWidget("Received / Debug (Rx)", self)
@@ -140,6 +147,93 @@ class MainWindow(QtWidgets.QMainWindow):
             if not nm:
                 nm = f"DO{i}"
             names.append(nm)
+
+    def _act_apply_config(self):
+        """Re-apply the current in-memory config to UI and, if connected, to the device."""
+        try:
+            # 1) Push config to UI (names/units, AO slider ranges/defaults, DO UI, etc.)
+            if hasattr(self, "_apply_cfg_to_ui"):
+                self._apply_cfg_to_ui()
+
+            # 2) If not connected, we’re done (UI reflects config; device will pick it up on connect)
+            if not (self.daq and getattr(self.daq, "connected", False)):
+                self.log_rx("Config applied to UI (device is disconnected).")
+                return
+
+            # 3) If connected: stop worker and scan (if running)
+            try:
+                if hasattr(self, "acq_thread") and self.acq_thread:
+                    self.acq_thread.stop()
+                    self.acq_thread.wait(1000)
+                    self.acq_thread = None
+            except Exception as e:
+                self.log_rx(f"Acq worker stop: {e}")
+
+            try:
+                if hasattr(self.daq, "stop_ai_scan"):
+                    self.daq.stop_ai_scan()
+            except Exception as e:
+                self.log_rx(f"AI scan stop: {e}")
+
+            # 4) Apply DAQ-side settings
+            try:
+                if hasattr(self.daq, "set_ai_mode") and hasattr(self.cfg, "aiMode"):
+                    self.daq.set_ai_mode(self.cfg.aiMode)
+            except Exception as e:
+                self.log_rx(f"AI mode set error: {e}")
+
+            # Validate channels (handles SE/DIFF)
+            try:
+                valid = self.daq.probe_ai_channels(8)
+            except Exception:
+                valid = list(range(8))
+            high = max(valid) if valid else 0
+            for i in range(8):
+                # show/hide curves to match valid channels
+                if hasattr(self.analog_win, "curves"):
+                    self.analog_win.curves[i].setVisible(i in valid)
+
+            # 5) Restart the hardware scan with new rate/block
+            actual_rate = self.daq.start_ai_scan(
+                0, high, float(self.cfg.sampleRateHz), int(self.cfg.blockSize)
+            )
+            self.sample_period = 1.0 / max(1e-6, float(actual_rate))
+
+            # 6) Restart background acquisition worker (if your app uses it)
+            try:
+                from acq_worker import AcqWorker  # safe even if unused elsewhere
+                slopes = [a.slope for a in self.cfg.analogs]
+                offsets = [a.offset for a in self.cfg.analogs]
+                cutoffs = [a.cutoffHz for a in self.cfg.analogs]
+                self.acq_thread = AcqWorker(self.daq, slopes, offsets, cutoffs, actual_rate, self)
+                if hasattr(self, "_on_chunk_ready"):
+                    self.acq_thread.chunkReady.connect(
+                        self._on_chunk_ready, QtCore.Qt.ConnectionType.QueuedConnection
+                    )
+                self.acq_thread.start()
+            except Exception as e:
+                # If you don't use AcqWorker, this is fine; plotting still works with your existing loop.
+                self.log_rx(f"Acq worker init: {e}")
+
+            # 7) Reset histories (keeps charts consistent with new scaling/rates)
+            try:
+                self.ai_hist_x.clear()
+                for i in range(8):
+                    self.ai_hist_y[i].clear()
+                    self.do_hist_y[i].clear()
+            except Exception:
+                pass
+
+            # 8) Re-apply AO slider ranges/defaults and push to hardware
+            try:
+                for i in range(2):
+                    self._apply_ao_slider(i)
+            except Exception:
+                pass
+
+            self.log_rx("Config applied to running device.")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Apply Config Error", str(e))
 
     def _ensure_queue(self):
         # Create the chunk queue if it doesn't exist yet
