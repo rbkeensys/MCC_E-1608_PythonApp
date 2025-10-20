@@ -10,6 +10,7 @@ from config_editor import ConfigEditorDialog
 from script_editor import ScriptEditorDialog
 from collections import deque
 from acq_worker import AcqWorker
+from combined_chart import CombinedChartWindow
 
 class ScaleDialog(QtWidgets.QDialog):
     def __init__(self, parent, idx, y_min, y_max):
@@ -35,41 +36,106 @@ class ScaleDialog(QtWidgets.QDialog):
     def result_values(self): return self.chk_auto.isChecked(), self.sp_min.value(), self.sp_max.value()
 
 class MainWindow(QtWidgets.QMainWindow):
+
     def __init__(self):
-        super().__init__(); self.setWindowTitle("MCC E-1608 Control"); self.resize(1300, 800)
-        self.cfg = AppConfig(); self.daq=None
-        self.ai_filters=[OnePoleLPF(0.0, self.cfg.sampleRateHz) for _ in range(8)]; self.ai_filter_enabled=[False]*8
-        self.ai_hist_x=[]; self.ai_hist_y=[[] for _ in range(8)]; self.do_hist_y=[[] for _ in range(8)]
-        self.time_window_s=5.0; self.ui_rate_hz=50.0; self.sample_period = 1.0 / max(1e-6, self.cfg.sampleRateHz)
-        self.script_events=[]
-        self.analog_win = AnalogChartWindow([a.name for a in self.cfg.analogs], [a.units for a in self.cfg.analogs])
+        super().__init__()
+        self.setWindowTitle("MCC E-1608 Control")
+        self.resize(1300, 800)
+
+        # Core state
+        self.cfg = AppConfig()
+        self.daq = None
+        self.ai_filters = [OnePoleLPF(0.0, self.cfg.sampleRateHz) for _ in range(8)]
+        self.ai_filter_enabled = [False] * 8
+        self.ai_hist_x = []
+        self.ai_hist_y = [[] for _ in range(8)]
+        self.do_hist_y = [[] for _ in range(8)]
+        self.time_window_s = 5.0
+        self.ui_rate_hz = 50.0
+        self.sample_period = 1.0 / max(1e-6, self.cfg.sampleRateHz)
+        self.script_events = []
+
+        # Windows
+        self.analog_win = AnalogChartWindow(
+            [a.name for a in self.cfg.analogs],
+            [a.units for a in self.cfg.analogs],
+        )
         self.analog_win.requestScale.connect(self._on_request_scale)
         self.digital_win = DigitalChartWindow()
-        self._build_menu(); self._build_central(); self._build_status_panes()
-        self.loop_timer=QtCore.QTimer(self); self.loop_timer.timeout.connect(self._loop); self.loop_timer.start(int(1000/self.ui_rate_hz))
+
+        # Combined chart window
+        # Collect AO names/units robustly from current config
+        def _ao_field(name, default=""):
+            return getattr(self.cfg, name, default)
+        ao_names = []
+        ao_units = []
+        if hasattr(self.cfg, "aouts"):
+            for i in range(2):
+                nm = getattr(self.cfg.aouts[i], "name", f"AO{i}") if i < len(self.cfg.aouts) else f"AO{i}"
+                un = getattr(self.cfg.aouts[i], "units", "")
+                ao_names.append(nm); ao_units.append(un)
+        else:
+            for i in range(2):
+                nm = _ao_field(f"ao{i}Name", f"AO{i}")
+                un = _ao_field(f"ao{i}Units", "")
+                ao_names.append(nm); ao_units.append(un)
+
+        self.combined_win = CombinedChartWindow(
+            ai_names=[a.name for a in self.cfg.analogs],
+            ai_units=[a.units for a in self.cfg.analogs],
+            ao_names=ao_names,
+            ao_units=ao_units,
+            ao_default_range=(0.0, 10.0),
+        )
+
+        # Build UI
+        self._build_menu()
+        self._build_central()
+        self._build_status_panes()
+
+        # Timers
+        self.loop_timer = QtCore.QTimer(self)
+        self.loop_timer.timeout.connect(self._loop)
+        self.loop_timer.start(int(1000 / self.ui_rate_hz))
+
+        # Render timer decoupled from acquisition
+        self.render_rate_hz = 25.0
+        self.render_timer = QtCore.QTimer(self)
+        self.render_timer.timeout.connect(self._render)
+        self.render_timer.start(int(1000 / self.render_rate_hz))
+
+        # Queues, worker, script
         self._chunk_queue = deque()
-        self.script = ScriptRunner(self._set_do); self.script.tick.connect(self._on_script_tick)
+        self.acq_thread = None
+        self.script = ScriptRunner(self._set_do)
+        self.script.tick.connect(self._on_script_tick)
+
+        # Apply config to UI and titles
         self._apply_cfg_to_ui()
         self.analog_win.set_names_units(
             [a.name for a in self.cfg.analogs],
             [a.units for a in self.cfg.analogs],
         )
 
-        # decouple drawing from acquisition (~25 FPS)
-        self.render_rate_hz = 25.0
-        self.render_timer = QtCore.QTimer(self)
-        self.render_timer.timeout.connect(self._render)
-        self.render_timer.start(int(1000 / self.render_rate_hz))
+        # AO histories and defaults
+        self.ao_hist_y = [[], []]
+        def _ao_default(i, fallback=0.0):
+            if hasattr(self.cfg, "aouts"):
+                v = getattr(self.cfg.aouts[i], "startupV", None) if i < len(self.cfg.aouts) else None
+                if v is None:
+                    v = getattr(self.cfg.aouts[i], "default", None) if i < len(self.cfg.aouts) else None
+                return float(v) if v is not None else fallback
+            v = getattr(self.cfg, f"ao{i}Default", None)
+            return float(v) if v is not None else fallback
+        self.ao_value = [_ao_default(0, 0.0), _ao_default(1, 0.0)]
 
-        # optional safety
-        self.acq_thread = None
 
     def _build_menu(self):
         m=self.menuBar(); f=m.addMenu("&File")
         f.addAction("Load Config...", self._act_load_cfg); f.addAction("Save Config As...", self._act_save_cfg); f.addAction("Edit Config...", self._act_edit_cfg)
         f.addSeparator(); f.addAction("Load Script...", self._act_load_script); f.addAction("Save Script As...", self._act_save_script); f.addAction("Edit Script...", self._act_edit_script)
         f.addSeparator(); f.addAction("Quit", self.close)
-        v=m.addMenu("&View"); v.addAction("Show Analog Charts", self.analog_win.show); v.addAction("Show Digital Chart", self.digital_win.show)
+        v=m.addMenu("&View"); v.addAction("Show Analog Charts", self.analog_win.show); v.addAction("Show Digital Chart", self.digital_win.show); v.addAction("Show Combined Chart", self.combined_win.show)
 
     def _build_central(self):
         cw=QtWidgets.QWidget(); self.setCentralWidget(cw); grid=QtWidgets.QGridLayout(cw)
@@ -147,6 +213,23 @@ class MainWindow(QtWidgets.QMainWindow):
             if not nm:
                 nm = f"DO{i}"
             names.append(nm)
+
+            # Update combined chart titles
+            self.combined_win.set_ai_names_units(
+                [a.name for a in self.cfg.analogs],
+                [a.units for a in self.cfg.analogs],
+            )
+
+            # AO names/units (same logic you used above at creation)
+            ao_names = []
+            ao_units = []
+            for i in range(2):
+                nm = getattr(self.cfg, f"ao{i}Name", f"AO{i}")
+                u = getattr(self.cfg, f"ao{i}Units", "")
+                ao_names.append(nm)
+                ao_units.append(u)
+
+            self.combined_win.set_ao_names_units(ao_names, ao_units)
 
     def _act_apply_config(self):
         """Re-apply the current in-memory config to UI and, if connected, to the device."""
@@ -356,7 +439,10 @@ class MainWindow(QtWidgets.QMainWindow):
         v=max(max(-10.0,a.minV), min(min(10.0,a.maxV), v))
         self.ao_labels[idx].setText(f"AO{idx}: {v:.2f} V ({a.name})")
         if self.daq and getattr(self.daq,"connected",False): self.daq.set_ao_volts(idx, v)
-    def _apply_ao_slider(self, idx): self._on_ao_slider(idx, self.ao_sliders[idx].value())
+
+    def _apply_ao_slider(self, idx):
+        self._on_ao_slider(idx, self.ao_sliders[idx].value())
+        self.ao_value[idx] = self.ao_sliders[idx].value()
 
     def _on_do_pressed(self, idx):
         if self.do_chk_mom[idx].isChecked():
@@ -434,8 +520,16 @@ class MainWindow(QtWidgets.QMainWindow):
             if need > 0:
                 self.do_hist_y[i].extend([do_states[i]] * need)
         _, do_cut = self._tail_by_time(self.ai_hist_x, self.do_hist_y, self.time_window_s)
-        self.digital_win.set_data(x_cut, do_cut)
 
+        # Ensure AO histories match AI history length (repeat current value)
+        for i in range(2):
+            need = len(self.ai_hist_x) - len(self.ao_hist_y[i])
+            if need > 0:
+                self.ao_hist_y[i].extend([self.ao_value[i]] * need)
+        _, ao_cut = self._tail_by_time(self.ai_hist_x, self.ao_hist_y, self.time_window_s)
+
+        self.digital_win.set_data(x_cut, do_cut)
+        self.combined_win.set_data(x_cut, ys_cut, ao_cut, do_cut)
 
     def _loop(self):
         self._prune_history()
