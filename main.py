@@ -2,8 +2,31 @@ import sys, json
 import math
 import time
 import numpy as np
+from pid import PIDManager, PIDLoopDef
+import os
 
 from PyQt6 import QtCore, QtWidgets
+def _ro_flags(flags):
+    try:
+        # PyQt6
+        return flags & ~QtCore.Qt.ItemFlag.ItemIsEditable
+    except AttributeError:
+        # PyQt5
+        return flags & ~QtCore.Qt.ItemIsEditable
+
+# ---- Qt5/Qt6 dialog helpers ----
+def _dlg_exec(dlg):
+    try:
+        return dlg.exec()          # PyQt6
+    except AttributeError:
+        return dlg.exec_()         # PyQt5
+
+try:
+    DLG_ACCEPTED = QtWidgets.QDialog.DialogCode.Accepted  # PyQt6
+except Exception:
+    DLG_ACCEPTED = QtWidgets.QDialog.Accepted             # PyQt5
+
+from typing import Optional
 from config_manager import ConfigManager, AppConfig
 from daq_driver import DaqDriver, DaqError
 from filters import OnePoleLPF
@@ -16,6 +39,112 @@ from collections import deque
 from acq_worker import AcqWorker
 from combined_chart import CombinedChartWindow
 from bisect import bisect_left
+
+class PIDSetupDialog(QtWidgets.QDialog):
+    COLS = ["Enable","Type","AI ch","OUT ch","Target","P","I","D"]
+
+    def __init__(self, parent=None, existing=None):
+        super().__init__(parent)
+        self.setWindowTitle("PID Setup")
+        self.resize(800, 360)
+        v = QtWidgets.QVBoxLayout(self)
+        self.table = QtWidgets.QTableWidget(8, len(self.COLS), self)
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        v.addWidget(self.table)
+
+        btns = QtWidgets.QHBoxLayout()
+        self.btn_load = QtWidgets.QPushButton("Load PID.json")
+        self.btn_save = QtWidgets.QPushButton("Save PID.json")
+        self.btn_ok = QtWidgets.QPushButton("OK")
+        self.btn_cancel = QtWidgets.QPushButton("Cancel")
+        btns.addWidget(self.btn_load); btns.addWidget(self.btn_save)
+        btns.addStretch(1)
+        btns.addWidget(self.btn_ok); btns.addWidget(self.btn_cancel)
+        v.addLayout(btns)
+
+        self.btn_load.clicked.connect(self._on_load)
+        self.btn_save.clicked.connect(self._on_save)
+        self.btn_ok.clicked.connect(self.accept)
+        self.btn_cancel.clicked.connect(self.reject)
+
+        # Pre-fill from existing PIDManager.loops
+        if existing:
+            for r, lp in enumerate(existing[:8]):
+                self._set_row(r, lp)
+
+    def _set_row(self, r, lp):
+        def cb(val, checked=True):  # helper
+            w = QtWidgets.QCheckBox(); w.setChecked(val); return w
+        def combo(val):
+            w = QtWidgets.QComboBox(); w.addItems(["digital","analog"])
+            w.setCurrentText(val); return w
+        def spin(v, lo=0, hi=7, step=1):
+            w = QtWidgets.QSpinBox(); w.setRange(lo, hi); w.setValue(int(v)); w.setSingleStep(step); return w
+        def dspin(v, lo=-1e9, hi=1e9, step=0.1):
+            w = QtWidgets.QDoubleSpinBox(); w.setRange(lo, hi); w.setDecimals(4); w.setSingleStep(step); w.setValue(float(v)); return w
+
+        items = [
+            cb(lp.enabled),
+            combo(lp.kind),
+            spin(lp.ai_ch, 0, 7, 1),
+            spin(lp.out_ch, 0, 7 if lp.kind=="digital" else 1, 1),
+            dspin(lp.target),
+            dspin(lp.kp), dspin(lp.ki), dspin(lp.kd)
+        ]
+        for c, w in enumerate(items):
+            self.table.setCellWidget(r, c, w)
+
+    def _row_to_def(self, r) -> Optional[dict]:
+        def getw(c): return self.table.cellWidget(r, c)
+        if not self.table.cellWidget(r, 0):  # empty row
+            return None
+        enabled = getw(0).isChecked()
+        kind = getw(1).currentText()
+        ai = getw(2).value()
+        out = getw(3).value()
+        target = getw(4).value()
+        kp = getw(5).value(); ki = getw(6).value(); kd = getw(7).value()
+        d = dict(enabled=enabled, kind=kind, ai_ch=ai, out_ch=out, target=target, kp=kp, ki=ki, kd=kd)
+        if kind == "analog":
+            d["out_min"] = -10.0
+            d["out_max"] = 10.0
+        return d
+
+    def values(self):
+        vals = []
+        for r in range(self.table.rowCount()):
+            d = self._row_to_def(r)
+            if d is not None:
+                # Ignore completely empty (all defaults) rows
+                if (not d["enabled"]) and d["kp"]==0 and d["ki"]==0 and d["kd"]==0:
+                    continue
+                vals.append(d)
+        return vals
+
+    def _on_load(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load PID.json", "", "JSON (*.json)")
+        if not path: return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                js = json.load(f)
+            loops = js.get("loops", [])
+            self.table.clearContents()
+            self.table.setRowCount(max(8, len(loops)))
+            for r, item in enumerate(loops[:8]):
+                from pid import PIDLoopDef
+                self._set_row(r, PIDLoopDef(**item))
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "PID load error", str(e))
+
+    def _on_save(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save PID.json", "PID.json", "JSON (*.json)")
+        if not path: return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"loops": self.values()}, f, indent=2)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "PID save error", str(e))
 
 class ScaleDialog(QtWidgets.QDialog):
     def __init__(self, parent, idx, y_min, y_max):
@@ -136,6 +265,19 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self.log_rx(f"[WARN] Could not auto-load defaults: {e}")
 
+        self.pid_mgr = PIDManager(self)
+        # Try to autoload PID.json (optional)
+        try:
+            if os.path.exists("PID.json"):
+                self.pid_mgr.load_file("PID.json")
+                self.log_rx("[INFO] Loaded PID.json")
+        except Exception as e:
+            self.log_rx(f"[WARN] PID.json load failed: {e}")
+
+        # Build/refresh the PID status table once at startup
+        self._pid_refresh_table_structure()
+        self._pid_update_table_values()
+
         # Timers
         self.loop_timer = QtCore.QTimer(self)
         self.loop_timer.timeout.connect(self._loop)
@@ -233,10 +375,40 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_menu(self):
         m=self.menuBar(); f=m.addMenu("&File")
-        f.addAction("Load Config...", self._act_load_cfg); f.addAction("Save Config As...", self._act_save_cfg); f.addAction("Edit Config...", self._act_edit_cfg)
-        f.addSeparator(); f.addAction("Load Script...", self._act_load_script); f.addAction("Save Script As...", self._act_save_script); f.addAction("Edit Script...", self._act_edit_script)
-        f.addSeparator(); f.addAction("Quit", self.close)
-        v=m.addMenu("&View"); v.addAction("Show Analog Charts", self.analog_win.show); v.addAction("Show Digital Chart", self.digital_win.show); v.addAction("Show Combined Chart", self.combined_win.show)
+        f.addAction("Load Config...", self._act_load_cfg);
+        f.addAction("Save Config As...", self._act_save_cfg);
+        f.addAction("Edit Config...", self._act_edit_cfg)
+        f.addSeparator();
+        f.addAction("Load Script...", self._act_load_script);
+        f.addAction("Save Script As...", self._act_save_script);
+        f.addAction("Edit Script...", self._act_edit_script)
+        f.addSeparator();
+        f.addAction("Quit", self.close)
+        v=m.addMenu("&View");
+        v.addAction("Show Analog Charts", self.analog_win.show);
+        v.addAction("Show Digital Chart", self.digital_win.show);
+        v.addAction("Show Combined Chart", self.combined_win.show)
+
+        # ---- PID Menu ----
+        pid_menu = self.menuBar().addMenu("&PID")
+
+        # self.act_pid_edit = QtWidgets.QAction("Edit PID…", self)
+        # self.act_pid_load = QtWidgets.QAction("Load PID.json…", self)
+        # self.act_pid_save = QtWidgets.QAction("Save PID.json…", self)
+        #
+        # self.act_pid_edit.triggered.connect(self._act_pid_setup)  # you already have this dialog method
+        # self.act_pid_load.triggered.connect(self._act_pid_load_json)
+        # self.act_pid_save.triggered.connect(self._act_pid_save_json)
+
+        pid_menu.addAction("Edit PID...", self._act_pid_setup)
+        pid_menu.addSeparator()
+        pid_menu.addAction("Load PID...", self._act_pid_load_json)
+        pid_menu.addAction("Save PID...", self._act_pid_save_json)
+
+        # pid_menu.addAction(self.act_pid_edit)
+        # pid_menu.addAction(self.act_pid_load)
+        # pid_menu.addAction(self.act_pid_save)
+
 
     def _build_central(self):
         cw=QtWidgets.QWidget(); self.setCentralWidget(cw); grid=QtWidgets.QGridLayout(cw)
@@ -252,6 +424,20 @@ class MainWindow(QtWidgets.QMainWindow):
             chk_m=QtWidgets.QCheckBox("Momentary"); gl.addWidget(chk_m,i,2); self.do_chk_mom.append(chk_m)
             sp=QtWidgets.QDoubleSpinBox(); sp.setSuffix(" s"); sp.setRange(0.0,3600.0); sp.setDecimals(3); sp.setSingleStep(0.1); sp.setValue(0.0); gl.addWidget(sp,i,3); self.do_time.append(sp)
         right=QtWidgets.QGroupBox("Analog Outputs / Timebase / Script"); grid.addWidget(right,0,1); rgl=QtWidgets.QGridLayout(right)
+
+        # ---- PID header row ----
+        self.btn_pid_setup = QtWidgets.QPushButton("PID Setup…")
+        self.btn_pid_setup.clicked.connect(self._act_pid_setup)
+        rgl.addWidget(self.btn_pid_setup, 7, 0, 1, 2)
+
+        # ---- PID live table (up to 8 rows) ----
+        self.pid_table = QtWidgets.QTableWidget(0, 11, self)
+        self.pid_table.setHorizontalHeaderLabels([
+            "Enable", "Type", "AIch", "OUTch", "AIValue", "Target", "CurrentError", "OutputValue", "P", "I", "D"
+        ])
+        self.pid_table.horizontalHeader().setStretchLastSection(True)
+        rgl.addWidget(self.pid_table, 8, 0, 1, 2)
+
         self.ao_sliders=[]; self.ao_labels=[]
         for i in range(2):
             lab=QtWidgets.QLabel(f"AO{i}: 0.00 V"); rgl.addWidget(lab,i*2,0,1,2)
@@ -478,6 +664,28 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg=ScriptEditorDialog(self,self.script_events)
         if dlg.exec(): self.script_events=dlg.result_events()
 
+    def _act_pid_load_json(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load PID.json", "", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            self.pid_mgr.load_file(path)
+            self.log_rx(f"[INFO] Loaded {path}")
+            self._pid_refresh_table_structure()
+            self._pid_update_table_values()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "PID load error", str(e))
+
+    def _act_pid_save_json(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save PID.json", "PID.json", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            self.pid_mgr.save_file(path)
+            self.log_rx(f"[INFO] Saved {path}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "PID save error", str(e))
+
     def _act_connect(self):
         self._ensure_queue()
 
@@ -691,6 +899,30 @@ class MainWindow(QtWidgets.QMainWindow):
                 arr = arr.reshape(1, -1)
             num_ch, M = int(arr.shape[0]), int(arr.shape[1])
 
+            # --- PID: run loops on this block and apply outputs ---
+            try:
+                # ai_block_2d shape must be (nsamples, nch)
+                ai_block_2d = arr.T  # we currently have (nch, M) -> transpose
+                do_updates, ao_updates = self.pid_mgr.process_block(ai_block_2d, float(sp))
+
+                # Apply DO updates ONLY if that channel is currently controlled by an enabled loop
+                for ch, bit in do_updates.items():
+                    if self.pid_mgr.is_do_controlled(ch):
+                        self._set_do(int(ch), bool(bit))  # updates self.do_state too
+
+                # Apply AO updates ONLY if that channel is currently controlled by an enabled loop
+                for ch, volts in ao_updates.items():
+                    if self.pid_mgr.is_ao_controlled(ch):
+                        self.ao_value[int(ch)] = float(volts)
+                        if self.daq and getattr(self.daq, "connected", False):
+                            self.daq.set_ao_volts(int(ch), float(volts))
+
+                # Update the PID live table after each processed block
+                self._pid_update_table_values()
+            except Exception as e:
+                self.log_rx(f"[PID] block apply: {e}")
+            # --- end PID block ---
+
             # Build relative X for this block
             start = 0.0 if (last_x is None) else (last_x + sp)
             x_block = start + np.arange(M, dtype=float) * sp
@@ -747,6 +979,199 @@ class MainWindow(QtWidgets.QMainWindow):
     def _act_reset_script(self):
         self.script.reset()
         self.log_rx("Script: RESET")
+
+    def _act_pid_setup(self):
+        dlg = PIDSetupDialog(self, existing=self.pid_mgr.loops)
+        if _dlg_exec(dlg) == DLG_ACCEPTED:
+            vals = dlg.values()
+            if len(vals) > 8:
+                QtWidgets.QMessageBox.warning(self, "PID", "Max 8 PID loops.")
+                vals = vals[:8]
+            self.pid_mgr.loops = [PIDLoopDef(**v) for v in vals]
+            self.pid_mgr._rebuild_instances()
+            self.pid_mgr.reset_states()
+            try:
+                self.pid_mgr.save_file("PID.json")
+                self.log_rx("[INFO] Saved PID.json")
+            except Exception as e:
+                self.log_rx(f"[WARN] PID.json save failed: {e}")
+            self._pid_refresh_table_structure()
+            self._pid_update_table_values()
+
+    def _pid_refresh_table_structure(self):
+        loops = getattr(self.pid_mgr, "loops", [])
+        self.pid_table.setRowCount(len(loops))
+        self.pid_table.setColumnCount(11)
+        self.pid_table.setHorizontalHeaderLabels([
+            "Enable", "Type", "AIch", "OUTch", "AIValue", "Target", "CurrentError", "OutputValue", "P", "I", "D"
+        ])
+        self.pid_table.horizontalHeader().setStretchLastSection(True)
+
+        for r, lp in enumerate(loops):
+            # Enable (editable)
+            cb = QtWidgets.QCheckBox()
+            cb.setChecked(bool(lp.enabled))
+            cb.stateChanged.connect(lambda state, row=r: self._pid_on_enable_row(row, state))
+            self.pid_table.setCellWidget(r, 0, cb)
+
+            # Type (editable)
+            typ = QtWidgets.QComboBox()
+            typ.addItems(["digital", "analog"])
+            typ.setCurrentText(lp.kind)
+            typ.currentTextChanged.connect(lambda text, row=r: self._pid_on_type_changed(row, text))
+            self.pid_table.setCellWidget(r, 1, typ)
+
+            # AI ch (editable)
+            sp_ai = QtWidgets.QSpinBox()
+            sp_ai.setRange(0, 7)
+            sp_ai.setValue(int(lp.ai_ch))
+            sp_ai.valueChanged.connect(lambda val, row=r: self._pid_on_ai_changed(row, val))
+            self.pid_table.setCellWidget(r, 2, sp_ai)
+
+            # OUT ch (editable; range depends on type)
+            sp_out = QtWidgets.QSpinBox()
+            if lp.kind == "analog":
+                sp_out.setRange(0, 1)
+            else:
+                sp_out.setRange(0, 7)
+            sp_out.setValue(int(lp.out_ch))
+            sp_out.valueChanged.connect(lambda val, row=r: self._pid_on_out_changed(row, val))
+            self.pid_table.setCellWidget(r, 3, sp_out)
+
+            # AIValue (read-only)
+            it = QtWidgets.QTableWidgetItem("—");
+            it.setFlags(_ro_flags(it.flags()))
+            self.pid_table.setItem(r, 4, it)
+
+            # Target (editable)
+            dsp_tgt = QtWidgets.QDoubleSpinBox()
+            dsp_tgt.setDecimals(4);
+            dsp_tgt.setRange(-1e9, 1e9);
+            dsp_tgt.setSingleStep(0.1)
+            dsp_tgt.setValue(float(lp.target))
+            dsp_tgt.valueChanged.connect(lambda val, row=r: self._pid_on_target_changed(row, val))
+            self.pid_table.setCellWidget(r, 5, dsp_tgt)
+
+            # CurrentError (read-only)
+            it = QtWidgets.QTableWidgetItem("—");
+            it.setFlags(_ro_flags(it.flags()))
+            self.pid_table.setItem(r, 6, it)
+
+            # OutputValue (read-only)
+            it = QtWidgets.QTableWidgetItem("—");
+            it.setFlags(_ro_flags(it.flags()))
+            self.pid_table.setItem(r, 7, it)
+
+            # P/I/D (editable)
+            for c, key in enumerate(["kp", "ki", "kd"], start=8):
+                dsp = QtWidgets.QDoubleSpinBox()
+                dsp.setDecimals(6);
+                dsp.setRange(-1e6, 1e6);
+                dsp.setSingleStep(0.01)
+                dsp.setValue(float(getattr(lp, key)))
+                dsp.valueChanged.connect(lambda val, row=r, k=key: self._pid_on_gain_changed(row, k, val))
+                self.pid_table.setCellWidget(r, c, dsp)
+
+    def _pid_update_table_values(self):
+        # Build a quick lookup of runtime objects by (kind, ai, out)
+        rt = {"digital": {}, "analog": {}}
+        for d in getattr(self.pid_mgr, "dloops", []):
+            rt["digital"][(d.defn.ai_ch, d.defn.out_ch)] = ("digital", d.last_ai, d.last_err, 1 if d.last_do_bit else 0)
+        for a in getattr(self.pid_mgr, "aloops", []):
+            rt["analog"][(a.defn.ai_ch, a.defn.out_ch)] = ("analog", a.last_ai, a.last_err, a.last_ao)
+
+        loops = getattr(self.pid_mgr, "loops", [])
+        for r, lp in enumerate(loops):
+            # AI value
+            ai_val = "—";
+            err_val = "—";
+            out_val = "—"
+            key = (lp.ai_ch, lp.out_ch)
+            hit = rt[lp.kind].get(key)
+            if hit:
+                _, ai, err, outv = hit
+                ai_val = f"{ai:.4f}" if (isinstance(ai, (int, float)) and math.isfinite(ai)) else "—"
+                err_val = f"{err:.4f}" if (isinstance(err, (int, float)) and math.isfinite(err)) else "—"
+                if lp.kind == "digital":
+                    out_val = str(int(bool(outv)))
+                else:
+                    out_val = f"{float(outv):.3f}" if (isinstance(outv, (int, float)) and math.isfinite(outv)) else "—"
+
+            for col, txt in [(4, ai_val), (6, err_val), (7, out_val)]:
+                it = self.pid_table.item(r, col)
+                if it is None:
+                    it = QtWidgets.QTableWidgetItem()
+                    it.setFlags(_ro_flags(QtCore.Qt.ItemFlag.ItemIsSelectable | QtCore.Qt.ItemFlag.ItemIsEnabled))
+                    self.pid_table.setItem(r, col, it)
+                it.setText(txt)
+
+def _pid_rebuild(self):
+    self.pid_mgr._rebuild_instances()
+    self.pid_mgr.reset_states()
+    self._pid_update_table_values()
+
+def _pid_on_enable_row(self, row, state):
+    enabled = int(state) != 0
+    try:
+        self.pid_mgr.loops[row].enabled = enabled
+        self._pid_rebuild()
+    except Exception as e:
+        self.log_rx(f"[PID] enable toggle failed: {e}")
+
+def _pid_on_type_changed(self, row, text):
+    try:
+        self.pid_mgr.loops[row].kind = text
+        # adjust OUT range for this row
+        w = self.pid_table.cellWidget(row, 3)
+        if isinstance(w, QtWidgets.QSpinBox):
+            if text == "analog":
+                w.setRange(0, 1)
+                if w.value() > 1: w.setValue(0)
+            else:
+                w.setRange(0, 7)
+        self._pid_rebuild()
+    except Exception as e:
+        self.log_rx(f"[PID] type change failed: {e}")
+
+def _pid_on_ai_changed(self, row, val):
+    try:
+        self.pid_mgr.loops[row].ai_ch = int(val)
+        self._pid_rebuild()
+    except Exception as e:
+        self.log_rx(f"[PID] AI ch change failed: {e}")
+
+def _pid_on_out_changed(self, row, val):
+    try:
+        self.pid_mgr.loops[row].out_ch = int(val)
+        self._pid_rebuild()
+    except Exception as e:
+        self.log_rx(f"[PID] OUT ch change failed: {e}")
+
+def _pid_on_target_changed(self, row, val):
+    try:
+        self.pid_mgr.loops[row].target = float(val)
+        # no rebuild needed for tuning only
+        self._pid_update_table_values()
+    except Exception as e:
+        self.log_rx(f"[PID] target change failed: {e}")
+
+def _pid_on_gain_changed(self, row, key, val):
+    try:
+        setattr(self.pid_mgr.loops[row], key, float(val))
+        # no full rebuild; core uses new gains next step, but to be safe:
+        self.pid_mgr.reset_states()
+        self._pid_update_table_values()
+    except Exception as e:
+        self.log_rx(f"[PID] gain change failed: {e}")
+
+# ---- Bind the standalone PID handlers to MainWindow (so self._pid_* works) ----
+MainWindow._pid_rebuild = _pid_rebuild
+MainWindow._pid_on_enable_row = _pid_on_enable_row
+MainWindow._pid_on_type_changed = _pid_on_type_changed
+MainWindow._pid_on_ai_changed = _pid_on_ai_changed
+MainWindow._pid_on_out_changed = _pid_on_out_changed
+MainWindow._pid_on_target_changed = _pid_on_target_changed
+MainWindow._pid_on_gain_changed = _pid_on_gain_changed
 
 def main():
     app=QtWidgets.QApplication(sys.argv); w=MainWindow(); w.show(); return app.exec()
