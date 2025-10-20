@@ -94,6 +94,10 @@ class AnalogChartWindow(QtWidgets.QMainWindow):
             plt = pg.PlotWidget()
             pi = plt.getPlotItem()
             pi.showGrid(x=True, y=True, alpha=0.2)
+            if i < len(self._names) - 1:
+                pi.hideAxis('bottom')
+            else:
+                pi.showAxis('bottom', show=True)
             pi.enableAutoRange(axis='y', enable=True)
 
             unit = f" [{self._units[i]}]" if (i < len(self._units) and self._units[i]) else ""

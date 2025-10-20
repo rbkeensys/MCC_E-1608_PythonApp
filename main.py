@@ -119,6 +119,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_menu()
         self._build_central()
         self._build_status_panes()
+        # Try to load default config/script automatically at startup
+        try:
+            import os
+            if os.path.exists("config.json"):
+                self._act_load_cfg("config.json")
+                self.log_rx("[INFO] Loaded default config.json")
+            else:
+                self.log_rx("[INFO] No default config.json found")
+
+            if os.path.exists("script.json"):
+                self._act_load_script("script.json")
+                self.log_rx("[INFO] Loaded default script.json")
+            else:
+                self.log_rx("[INFO] No default script.json found")
+        except Exception as e:
+            self.log_rx(f"[WARN] Could not auto-load defaults: {e}")
 
         # Timers
         self.loop_timer = QtCore.QTimer(self)
@@ -242,7 +258,7 @@ class MainWindow(QtWidgets.QMainWindow):
             s=QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal); s.setRange(-1000,1000); s.valueChanged.connect(lambda v, idx=i: self._on_ao_slider(idx, v)); rgl.addWidget(s,i*2+1,0,1,2)
             self.ao_labels.append(lab); self.ao_sliders.append(s)
         rgl.addWidget(QtWidgets.QLabel("Time window (s)"),4,0)
-        self.time_spin=QtWidgets.QDoubleSpinBox(); self.time_spin.setRange(0.01,10.0); self.time_spin.setDecimals(3); self.time_spin.setSingleStep(0.01); self.time_spin.setValue(self.time_window_s)
+        self.time_spin=QtWidgets.QDoubleSpinBox(); self.time_spin.setRange(0.01,100.0); self.time_spin.setDecimals(3); self.time_spin.setSingleStep(0.01); self.time_spin.setValue(self.time_window_s)
         self.time_spin.valueChanged.connect(self._on_time_window); rgl.addWidget(self.time_spin,4,1)
         self.btn_connect=QtWidgets.QPushButton("Connect")
         self.btn_connect.clicked.connect(self._act_connect); rgl.addWidget(self.btn_connect,5,0)
@@ -410,10 +426,16 @@ class MainWindow(QtWidgets.QMainWindow):
             from collections import deque
             self._chunk_queue = deque()
 
-    def _act_load_cfg(self):
-        path,_=QtWidgets.QFileDialog.getOpenFileName(self,"Load config.json","","JSON (*.json)")
-        if not path: return
-        self.cfg=ConfigManager.load(path); self._apply_cfg_to_ui(); self.log_rx(f"Loaded config: {path}"); self._act_edit_cfg()
+    def _act_load_cfg(self, path=None, show_editor=True):
+        if not path:
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load config.json", "", "JSON (*.json)")
+            if not path:
+                return
+        self.cfg = ConfigManager.load(path)
+        self._apply_cfg_to_ui()
+        self.log_rx(f"Loaded config: {path}")
+        if show_editor:
+            self._act_edit_cfg()
 
     def _act_save_cfg(self):
         for i in range(8):
@@ -430,13 +452,19 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg=dlg.updated_config(); self.sample_period = 1.0 / max(1e-6, self.cfg.sampleRateHz); self._apply_cfg_to_ui()
             self._rebuild_histories_for_span()
 
-    def _act_load_script(self):
-        path,_=QtWidgets.QFileDialog.getOpenFileName(self,"Load script.json","","JSON (*.json)")
-        if not path: return
+    def _act_load_script(self, path=None, show_editor=True):
+        if not path:
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load script.json", "", "JSON (*.json)")
+            if not path:
+                return
         try:
-            with open(path,"r",encoding="utf-8") as f: self.script_events=json.load(f)
-            self.log_rx(f"Loaded script: {path}"); self._act_edit_script()
-        except Exception as e: QtWidgets.QMessageBox.critical(self,"Script error",str(e))
+            with open(path, "r", encoding="utf-8") as f:
+                self.script_events = json.load(f)
+            self.log_rx(f"Loaded script: {path}")
+            if show_editor:
+                self._act_edit_script()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Script error", str(e))
 
     def _act_save_script(self):
         path,_=QtWidgets.QFileDialog.getSaveFileName(self,"Save script.json","script.json","JSON (*.json)")
@@ -506,7 +534,9 @@ class MainWindow(QtWidgets.QMainWindow):
         except DaqError as e:
             QtWidgets.QMessageBox.critical(self, "DAQ error", str(e))
 
-    def _on_time_window(self, v): self.time_window_s=float(v)
+    def _on_time_window(self, v):
+        self.time_window_s=float(v)
+        self._on_span_changed(float(v))
 
     def _on_chunk_ready(self, payload: object):
         self._ensure_queue()
@@ -523,10 +553,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.analog_win.set_fixed_scale(idx,mn,mx)
 
     def _on_ao_slider(self, idx, raw_val):
-        v=0.01*float(raw_val); a=self.cfg.analogOutputs[idx]
-        v=max(max(-10.0,a.minV), min(min(10.0,a.maxV), v))
+        v = 0.01 * float(raw_val)
+        a = self.cfg.analogOutputs[idx]
+        v = max(max(-10.0, a.minV), min(min(10.0, a.maxV), v))
         self.ao_labels[idx].setText(f"AO{idx}: {v:.2f} V ({a.name})")
-        if self.daq and getattr(self.daq,"connected",False): self.daq.set_ao_volts(idx, v)
+
+        # Remember current AO for plotting in Combined window
+        if not hasattr(self, "ao_value"):
+            self.ao_value = [0.0, 0.0]
+        self.ao_value[idx] = float(v)
+
+        # Send to hardware if connected
+        if self.daq and getattr(self.daq, "connected", False):
+            self.daq.set_ao_volts(idx, v)
 
     def _apply_ao_slider(self, idx):
         self._on_ao_slider(idx, self.ao_sliders[idx].value())
@@ -694,14 +733,6 @@ class MainWindow(QtWidgets.QMainWindow):
             trim=len(self.ai_hist_x)-max_pts; self.ai_hist_x=self.ai_hist_x[trim:]
             for i in range(8):
                 self.ai_hist_y[i]=self.ai_hist_y[i][trim:]; self.do_hist_y[i]=self.do_hist_y[i][trim:]
-
-    @staticmethod
-    def _tail_by_time(x, ys, window_s):
-        if not x: return [], [[] for _ in ys]
-        t_end=x[-1]; t_start=t_end-window_s; start_idx=0
-        for i, xv in enumerate(x):
-            if xv>=t_start: start_idx=i; break
-        x_cut=x[start_idx:]; ys_cut=[y[start_idx:] for y in ys]; return x_cut, ys_cut
 
     def _act_run_script(self):
         # Use whatever is currently in the editor buffer

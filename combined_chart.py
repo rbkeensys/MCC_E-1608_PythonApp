@@ -126,8 +126,8 @@ class CombinedChartWindow(QtWidgets.QMainWindow):
         self.do_plot = pg.PlotWidget()
         self.do_plot.setMinimumHeight(220)  # keep usable when splitter is small
         dpi = self.do_plot.getPlotItem()
-        dpi.showGrid(x=True, y=True, alpha=0.2)
         # fixed scale + no mouse
+        dpi.showAxis('bottom', show=True)  # DO keeps its X axis visible
         vb = dpi.getViewBox()
         vb.setMenuEnabled(False)
         vb.setMouseEnabled(x=False, y=False)
@@ -213,6 +213,7 @@ class CombinedChartWindow(QtWidgets.QMainWindow):
         plt = pg.PlotWidget()
         pi = plt.getPlotItem()
         pi.showGrid(x=True, y=True, alpha=0.2)
+        pi.hideAxis('bottom')
         unit_txt = f" [{unit}]" if unit else ""
         pi.setTitle(f"{name}{unit_txt}")
         pi.getViewBox().setMenuEnabled(False)
