@@ -1,74 +1,75 @@
 {
   "boardNum": 0,
-  "sampleRateHz": 1000.0,
+  "sampleRateHz": 100.0,
   "blockSize": 128,
+  "aiMode": "SE",
   "analogs": [
     {
-      "name": "AI",
+      "name": "Voltage",
       "slope": 1.0,
       "offset": 0.0,
-      "cutoffHz": 0.0,
+      "cutoffHz": 1.0,
       "units": ""
     },
     {
-      "name": "AI",
-      "slope": 1.0,
-      "offset": 0.0,
-      "cutoffHz": 0.0,
+      "name": "Out Temp",
+      "slope": 22.0,
+      "offset": 32.0,
+      "cutoffHz": 0.005,
       "units": ""
     },
     {
-      "name": "AI",
-      "slope": 1.0,
-      "offset": 0.0,
-      "cutoffHz": 0.0,
+      "name": "In Temp",
+      "slope": 22.0,
+      "offset": 32.0,
+      "cutoffHz": 0.1,
       "units": ""
     },
     {
-      "name": "AI",
-      "slope": 1.0,
-      "offset": 0.0,
-      "cutoffHz": 0.0,
+      "name": "Pressure",
+      "slope": 5.0,
+      "offset": -25.0,
+      "cutoffHz": 5.0,
       "units": ""
     },
     {
-      "name": "AI",
+      "name": "Spare 0",
       "slope": 1.0,
       "offset": 0.0,
-      "cutoffHz": 0.0,
+      "cutoffHz": 0.1,
       "units": ""
     },
     {
-      "name": "AI",
+      "name": "Spare 1",
       "slope": 1.0,
       "offset": 0.0,
-      "cutoffHz": 0.0,
+      "cutoffHz": 1.0,
       "units": ""
     },
     {
-      "name": "AI",
+      "name": "Spare 2",
       "slope": 1.0,
       "offset": 0.0,
-      "cutoffHz": 0.0,
+      "cutoffHz": 2.0,
       "units": ""
     },
     {
-      "name": "AI",
+      "name": "Spare 3",
       "slope": 1.0,
       "offset": 0.0,
-      "cutoffHz": 0.0,
+      "cutoffHz": 5.0,
       "units": ""
     }
   ],
   "digitalOutputs": [
     {
-      "name": "DO",
+      "name": "Relay1",
       "normallyOpen": false,
       "momentary": false,
       "actuationTime": 0.0
     },
     {
-      "name": "DO",
+      "name": "Valve N2",
       "normallyOpen": true,
       "momentary": false,
       "actuationTime": 0.0

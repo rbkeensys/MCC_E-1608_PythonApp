@@ -8,6 +8,8 @@ from digital_chart import DigitalChartWindow
 from script_runner import ScriptRunner
 from config_editor import ConfigEditorDialog
 from script_editor import ScriptEditorDialog
+from collections import deque
+from acq_worker import AcqWorker
 
 class ScaleDialog(QtWidgets.QDialog):
     def __init__(self, parent, idx, y_min, y_max):
@@ -15,8 +17,10 @@ class ScaleDialog(QtWidgets.QDialog):
         self.setWindowTitle(f"Scale AI{idx}")
         self.setModal(True)
         form = QtWidgets.QFormLayout(self)
+        self.chk_auto = QtWidgets.QCheckBox("Auto-scale");
+        self.chk_auto.setChecked(False);
+        form.addRow(self.chk_auto)
 
-        self.chk_auto = QtWidgets.QCheckBox("Auto-scale"); self.chk_auto.setChecked(False); form.addRow(self.chk_auto)
         def mk(v):
             sp = QtWidgets.QDoubleSpinBox()
             sp.setRange(-1e12, 1e12); sp.setDecimals(6); sp.setSingleStep(0.1)
@@ -43,8 +47,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.digital_win = DigitalChartWindow()
         self._build_menu(); self._build_central(); self._build_status_panes()
         self.loop_timer=QtCore.QTimer(self); self.loop_timer.timeout.connect(self._loop); self.loop_timer.start(int(1000/self.ui_rate_hz))
+        self._chunk_queue = deque()
         self.script = ScriptRunner(self._set_do); self.script.tick.connect(self._on_script_tick)
         self._apply_cfg_to_ui()
+        self.analog_win.set_names_units(
+            [a.name for a in self.cfg.analogs],
+            [a.units for a in self.cfg.analogs],
+        )
+
+        # decouple drawing from acquisition (~25 FPS)
+        self.render_rate_hz = 25.0
+        self.render_timer = QtCore.QTimer(self)
+        self.render_timer.timeout.connect(self._render)
+        self.render_timer.start(int(1000 / self.render_rate_hz))
+
+        # optional safety
+        self.acq_thread = None
 
     def _build_menu(self):
         m=self.menuBar(); f=m.addMenu("&File")
@@ -89,6 +107,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def log_rx(self, msg): self.rx_text.appendPlainText(msg)
 
     def _apply_cfg_to_ui(self):
+        names = []
         for i in range(8):
             self.do_btns[i].setText(f"{i}: {self.cfg.digitalOutputs[i].name}")
             self.do_chk_no[i].setChecked(self.cfg.digitalOutputs[i].normallyOpen)
@@ -103,6 +122,30 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ai_filters[i].set_fs(self.ui_rate_hz); self.ai_filters[i].set_cutoff(self.cfg.analogs[i].cutoffHz)
             self.ai_filter_enabled[i]=(self.cfg.analogs[i].cutoffHz>0.0)
         self.analog_win.setWindowTitle("Analog Inputs — " + ", ".join([a.name for a in self.cfg.analogs]))
+        self.analog_win.set_names_units(
+            [a.name for a in self.cfg.analogs],
+            [a.units for a in self.cfg.analogs],
+        )
+        for i in range(8):
+            nm = None
+            # Try a few common layouts; keep whatever matches your Config class
+            if hasattr(self.cfg, "douts"):  # e.g., self.cfg.douts[i].name
+                nm = getattr(self.cfg.douts[i], "name", None)
+            if nm is None and hasattr(self.cfg, "dos"):  # e.g., self.cfg.dos[i].name
+                nm = getattr(self.cfg.dos[i], "name", None)
+            if nm is None and hasattr(self.cfg, "doNames"):  # e.g., list of strings
+                nm = self.cfg.doNames[i]
+            if nm is None and hasattr(self.cfg, "do0Name"):  # legacy flat keys
+                nm = getattr(self.cfg, f"do{i}Name", None)
+            if not nm:
+                nm = f"DO{i}"
+            names.append(nm)
+
+    def _ensure_queue(self):
+        # Create the chunk queue if it doesn't exist yet
+        if not hasattr(self, "_chunk_queue") or self._chunk_queue is None:
+            from collections import deque
+            self._chunk_queue = deque()
 
     def _act_load_cfg(self):
         path,_=QtWidgets.QFileDialog.getOpenFileName(self,"Load config.json","","JSON (*.json)")
@@ -144,23 +187,67 @@ class MainWindow(QtWidgets.QMainWindow):
         if dlg.exec(): self.script_events=dlg.result_events()
 
     def _act_connect(self):
-        if self.daq and getattr(self.daq,"connected",False):
-            self.daq.disconnect(); self.daq=None; self.btn_connect.setText("Connect"); return
+        self._ensure_queue()
+
+        # Disconnect path
+        if self.daq and getattr(self.daq, 'connected', False):
+            try:
+                if hasattr(self, 'acq_thread') and self.acq_thread:
+                    self.acq_thread.stop()
+                    self.acq_thread.wait(1000)
+                    self.acq_thread = None
+            except Exception:
+                pass
+            self.daq.disconnect()
+            self.daq = None
+            self.btn_connect.setText("Connect")
+            return
+
+        # Connect path
         try:
-            self.daq=DaqDriver(self.cfg.boardNum,self.log_tx,self.log_rx); self.daq.connect()
-            _=self.daq.set_ai_mode(self.cfg.aiMode)
-            valid=self.daq.probe_ai_channels(8); high=max(valid) if valid else 0
-            for i in range(8): self.analog_win.curves[i].setVisible(i in valid)
-            if not getattr(self.daq, "_scan_running", False):
-                actual_rate = self.daq.start_ai_scan(0, high, self.cfg.sampleRateHz, self.cfg.blockSize)
-            else:
-                actual_rate = self.daq._scan_rate
+            self.daq = DaqDriver(self.cfg.boardNum, self.log_tx, self.log_rx)
+            self.daq.connect()
+            _ = self.daq.set_ai_mode(self.cfg.aiMode)
+            valid = self.daq.probe_ai_channels(8)
+            high = max(valid) if valid else 0
+            for i in range(8):
+                self.analog_win.curves[i].setVisible(i in valid)
+
+            # Start hardware scan
+            actual_rate = self.daq.start_ai_scan(0, high, self.cfg.sampleRateHz, self.cfg.blockSize)
             self.sample_period = 1.0 / max(1e-6, float(actual_rate))
+
+            # Start background acquisition worker (does calibration + LPF)
+            slopes = [a.slope for a in self.cfg.analogs]
+            offsets = [a.offset for a in self.cfg.analogs]
+            cutoffs = [a.cutoffHz for a in self.cfg.analogs]
+            self.acq_thread = AcqWorker(self.daq, slopes, offsets, cutoffs, actual_rate, self)
+            self.acq_thread.chunkReady.connect(self._on_chunk_ready, QtCore.Qt.ConnectionType.QueuedConnection)
+            self.acq_thread.start()
+
+            # Reset histories and the queue
+            self.ai_hist_x.clear()
+            for i in range(8):
+                self.ai_hist_y[i].clear()
+                self.do_hist_y[i].clear()
+
+            if not hasattr(self, "_chunk_queue"):
+                self._chunk_queue = deque()
+            self._chunk_queue.clear()
+
             self.btn_connect.setText("Disconnect")
-            for i in range(2): self._apply_ao_slider(i)
-        except DaqError as e: QtWidgets.QMessageBox.critical(self,"DAQ error",str(e))
+            for i in range(2):
+                self._apply_ao_slider(i)
+        except DaqError as e:
+            QtWidgets.QMessageBox.critical(self, "DAQ error", str(e))
 
     def _on_time_window(self, v): self.time_window_s=float(v)
+
+    def _on_chunk_ready(self, payload: object):
+        self._ensure_queue()
+        # payload: {"low": int, "num_ch": int, "M": int, "data": np.ndarray[num_ch, M]}
+        self._chunk_queue.append(payload)
+
     def _on_request_scale(self, idx):
         y_min,y_max=self.analog_win.get_y_range(idx); dlg=ScaleDialog(self,idx,y_min,y_max)
         if dlg.exec():
@@ -181,10 +268,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.do_chk_mom[idx].isChecked():
             no=self.do_chk_no[idx].isChecked(); self.do_btns[idx].setChecked(True)
             if self.daq and getattr(self.daq,"connected",False): self._set_do(idx, True if no else False)
+
     def _on_do_released(self, idx):
         if self.do_chk_mom[idx].isChecked():
             no=self.do_chk_no[idx].isChecked(); self.do_btns[idx].setChecked(False)
             if self.daq and getattr(self.daq,"connected",False): self._set_do(idx, False if no else True)
+
     def _on_do_clicked(self, idx, checked):
         no=self.do_chk_no[idx].isChecked(); momentary=self.do_chk_mom[idx].isChecked(); act_time=float(self.do_time[idx].value())
         if momentary: return
@@ -196,9 +285,11 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             state=(checked if no else (not checked))
             if self.daq and getattr(self.daq,"connected",False): self._set_do(idx, state)
+
     def _release_do(self, idx, no):
         self.do_btns[idx].setChecked(False)
         if self.daq and getattr(self.daq,"connected",False): self._set_do(idx, False if no else True)
+
     def _set_do(self, idx, state: bool):
         if self.daq and getattr(self.daq,"connected",False):
             try: self.daq.set_do_bit(idx, state)
@@ -208,46 +299,52 @@ class MainWindow(QtWidgets.QMainWindow):
         for i,st in enumerate(relays[:8]):
             blk=self.do_btns[i].blockSignals(True); self.do_btns[i].setChecked(bool(st)); self.do_btns[i].blockSignals(blk)
 
-    def _loop(self):
-        # Drain hardware AI scan
-        if self.daq and getattr(self.daq,"connected",False) and hasattr(self.daq,"read_ai_new"):
-            try:
-                pkt=self.daq.read_ai_new()
-                low, num_ch, ch_lists = pkt
-                if ch_lists and any(len(c) for c in ch_lists):
-                    M = len(ch_lists[0])  # all equal now (frame-aligned)
-                    # extend X by exactly M ticks
-                    start = (self.ai_hist_x[-1] + self.sample_period) if self.ai_hist_x else 0.0
-                    self.ai_hist_x.extend([start + k * self.sample_period for k in range(M)])
+    def _render(self):
+        self._ensure_queue()
 
-                    present = set(range(low, low + num_ch))
-                    fs = 1.0 / self.sample_period  # use hardware rate for filters
+        # Drain all queued chunks
+        while self._chunk_queue:
+            pkt = self._chunk_queue.popleft()
+            low = int(pkt["low"]);
+            num_ch = int(pkt["num_ch"]);
+            M = int(pkt["M"])
+            data = pkt["data"]  # shape (num_ch, M), already calibrated + filtered
 
-                    for ch in range(8):
-                        if ch in present:
-                            a = self.cfg.analogs[ch]
-                            for v in ch_lists[ch - low]:
-                                v = v * a.slope + a.offset
-                                if self.ai_filter_enabled[ch] and a.cutoffHz > 0.0:
-                                    self.ai_filters[ch].set_fs(fs)
-                                    v = self.ai_filters[ch].process(v)
-                                self.ai_hist_y[ch].append(v)
-                        else:
-                            # pad to keep arrays aligned across 8 channels
-                            self.ai_hist_y[ch].extend([float('nan')] * M)
-            except Exception as e: self.log_rx(f"AI scan error: {e}")
+            # Extend X
+            start = (self.ai_hist_x[-1] + self.sample_period) if self.ai_hist_x else 0.0
+            self.ai_hist_x.extend([start + k * self.sample_period for k in range(M)])
 
+            present = set(range(low, low + num_ch))
+            for ch in range(8):
+                if ch in present:
+                    self.ai_hist_y[ch].extend(data[ch - low, :].tolist())
+                else:
+                    self.ai_hist_y[ch].extend([float('nan')] * M)
+
+        # Keep history bounded to window + small slack
         self._prune_history()
 
-        if self.ai_hist_x:
-            x_cut, ys_cut = self._tail_by_time(self.ai_hist_x, self.ai_hist_y, self.time_window_s)
-            self.analog_win.set_data(x_cut, ys_cut)
-            do_states=[1 if self.do_btns[i].isChecked() else 0 for i in range(8)]
-            for i in range(8):
-                needed=len(self.ai_hist_x)-len(self.do_hist_y[i])
-                if needed>0: self.do_hist_y[i].extend([do_states[i]]*needed)
-            _, do_cut = self._tail_by_time(self.ai_hist_x, self.do_hist_y, self.time_window_s)
-            self.digital_win.set_data(x_cut, do_cut)
+        # Skip a frame while dragging to keep it smooth
+        if QtWidgets.QApplication.mouseButtons() != QtCore.Qt.MouseButton.NoButton:
+            return
+        if not self.ai_hist_x:
+            return
+
+        x_cut, ys_cut = self._tail_by_time(self.ai_hist_x, self.ai_hist_y, self.time_window_s)
+        self.analog_win.set_data(x_cut, ys_cut)
+
+        # Digital chart aligned to same X
+        do_states = [1 if self.do_btns[i].isChecked() else 0 for i in range(8)]
+        for i in range(8):
+            need = len(self.ai_hist_x) - len(self.do_hist_y[i])
+            if need > 0:
+                self.do_hist_y[i].extend([do_states[i]] * need)
+        _, do_cut = self._tail_by_time(self.ai_hist_x, self.do_hist_y, self.time_window_s)
+        self.digital_win.set_data(x_cut, do_cut)
+
+
+    def _loop(self):
+        self._prune_history()
 
     def _prune_history(self):
         max_pts=int(max(1.0, self.cfg.sampleRateHz)*12.0)
