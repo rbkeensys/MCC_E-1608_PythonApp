@@ -41,7 +41,8 @@ from combined_chart import CombinedChartWindow
 from bisect import bisect_left
 
 class PIDSetupDialog(QtWidgets.QDialog):
-    COLS = ["Enable","Type","AI ch","OUT ch","Target","P","I","D"]
+    COLS = ["Enable","Type","AI ch","OUT ch","Target","P","I","D",
+            "ErrMin","ErrMax","IMin","IMax"]  # NEW clamp columns
 
     def __init__(self, parent=None, existing=None):
         super().__init__(parent)
@@ -95,6 +96,25 @@ class PIDSetupDialog(QtWidgets.QDialog):
         for c, w in enumerate(items):
             self.table.setCellWidget(r, c, w)
 
+        # ErrMin / ErrMax
+        dsp_emn = QtWidgets.QDoubleSpinBox(); dsp_emn.setDecimals(4); dsp_emn.setRange(-1e9, 1e9); dsp_emn.setSingleStep(0.1)
+        dsp_emx = QtWidgets.QDoubleSpinBox(); dsp_emx.setDecimals(4); dsp_emx.setRange(-1e9, 1e9); dsp_emx.setSingleStep(0.1)
+        dsp_emn.setValue(float(lp.err_min) if lp.err_min is not None else 0.0)
+        dsp_emx.setValue(float(lp.err_max) if lp.err_max is not None else 0.0)
+        # Use checkbox-like enable? To keep simple, interpret 0==unset if both 0 and user wants no clamp
+
+        # IMin / IMax
+        dsp_imn = QtWidgets.QDoubleSpinBox(); dsp_imn.setDecimals(4); dsp_imn.setRange(-1e9, 1e9); dsp_imn.setSingleStep(0.1)
+        dsp_imx = QtWidgets.QDoubleSpinBox(); dsp_imx.setDecimals(4); dsp_imx.setRange(-1e9, 1e9); dsp_imx.setSingleStep(0.1)
+        dsp_imn.setValue(float(lp.i_min) if lp.i_min is not None else 0.0)
+        dsp_imx.setValue(float(lp.i_max) if lp.i_max is not None else 0.0)
+
+        # place in columns 8..11
+        self.table.setCellWidget(r, 8, dsp_emn)
+        self.table.setCellWidget(r, 9, dsp_emx)
+        self.table.setCellWidget(r, 10, dsp_imn)
+        self.table.setCellWidget(r, 11, dsp_imx)
+
     def _row_to_def(self, r) -> Optional[dict]:
         def getw(c): return self.table.cellWidget(r, c)
         if not self.table.cellWidget(r, 0):  # empty row
@@ -104,8 +124,24 @@ class PIDSetupDialog(QtWidgets.QDialog):
         ai = getw(2).value()
         out = getw(3).value()
         target = getw(4).value()
-        kp = getw(5).value(); ki = getw(6).value(); kd = getw(7).value()
-        d = dict(enabled=enabled, kind=kind, ai_ch=ai, out_ch=out, target=target, kp=kp, ki=ki, kd=kd)
+        kp = getw(5).value()
+        ki = getw(6).value()
+        kd = getw(7).value()
+        err_min = self.table.cellWidget(r, 8).value()
+        err_max = self.table.cellWidget(r, 9).value()
+        i_min = self.table.cellWidget(r, 10).value()
+        i_max = self.table.cellWidget(r, 11).value()
+
+        # normalize zeros to None (no clamp) if both ends are 0
+        def nz(x):
+            return None if (abs(float(x)) < 1e-12) else float(x)
+
+        d = dict(
+            enabled=enabled, kind=kind, ai_ch=ai, out_ch=out,
+            target=target, kp=kp, ki=ki, kd=kd,
+            err_min=nz(err_min), err_max=nz(err_max),
+            i_min=nz(i_min), i_max=nz(i_max)
+        )
         if kind == "analog":
             d["out_min"] = -10.0
             d["out_max"] = 10.0
@@ -427,16 +463,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ---- PID header row ----
         self.btn_pid_setup = QtWidgets.QPushButton("PID Setup…")
-        self.btn_pid_setup.clicked.connect(self._act_pid_setup)
-        rgl.addWidget(self.btn_pid_setup, 7, 0, 1, 2)
+        self.btn_pid_reset = QtWidgets.QPushButton("Reset PIDs")
+        self.btn_pid_reset.clicked.connect(self._act_pid_reset)
+        rgl.addWidget(self.btn_pid_setup, 8, 0, 1, 1)
+        rgl.addWidget(self.btn_pid_reset, 8, 1, 1, 1)
 
         # ---- PID live table (up to 8 rows) ----
         self.pid_table = QtWidgets.QTableWidget(0, 11, self)
         self.pid_table.setHorizontalHeaderLabels([
-            "Enable", "Type", "AIch", "OUTch", "AIValue", "Target", "CurrentError", "OutputValue", "P", "I", "D"
+            "Enable", "Type", "AIch", "OUTch", "AIValue", "Target", "PID u", "OutputValue", "P", "I", "D"
         ])
         self.pid_table.horizontalHeader().setStretchLastSection(True)
-        rgl.addWidget(self.pid_table, 8, 0, 1, 2)
+        rgl.addWidget(self.pid_table, 9, 0, 1, 2)
 
         self.ao_sliders=[]; self.ao_labels=[]
         for i in range(2):
@@ -675,6 +713,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._pid_update_table_values()
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "PID load error", str(e))
+
+    def _act_pid_reset(self):
+        try:
+            self.pid_mgr.reset_states()
+            self._pid_update_table_values()
+            self.log_rx("[INFO] PID states reset (I and D memory cleared)")
+        except Exception as e:
+            self.log_rx(f"[PID] reset failed: {e}")
 
     def _act_pid_save_json(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save PID.json", "PID.json", "JSON (*.json)")
@@ -1075,29 +1121,53 @@ class MainWindow(QtWidgets.QMainWindow):
     def _pid_update_table_values(self):
         # Build a quick lookup of runtime objects by (kind, ai, out)
         rt = {"digital": {}, "analog": {}}
+
+        # Digital: use control effort 'u' (P+I+D); OutputValue is 0/1 after NO/NC mapping
         for d in getattr(self.pid_mgr, "dloops", []):
-            rt["digital"][(d.defn.ai_ch, d.defn.out_ch)] = ("digital", d.last_ai, d.last_err, 1 if d.last_do_bit else 0)
+            u = getattr(d, "last_u", float("nan"))  # computed PID sum
+            out_bit = None
+            if isinstance(getattr(d, "last_do_bit", None), bool):
+                out_bit = 1 if d.last_do_bit else 0
+            rt["digital"][(d.defn.ai_ch, d.defn.out_ch)] = (
+                "digital", d.last_ai, u, out_bit
+            )
+
+        # Analog: show pre-clamp PID sum (last_u_pre) as PID Result; OutputValue is clamped AO volts
         for a in getattr(self.pid_mgr, "aloops", []):
-            rt["analog"][(a.defn.ai_ch, a.defn.out_ch)] = ("analog", a.last_ai, a.last_err, a.last_ao)
+            u_pre = getattr(a, "last_u_pre", getattr(a, "last_u", float("nan")))
+            rt["analog"][(a.defn.ai_ch, a.defn.out_ch)] = (
+                "analog", a.last_ai, u_pre, a.last_ao
+            )
 
         loops = getattr(self.pid_mgr, "loops", [])
         for r, lp in enumerate(loops):
-            # AI value
-            ai_val = "—";
-            err_val = "—";
+            ai_val = "—"
+            pid_val = "—"  # <-- PID Result (P+I+D)
             out_val = "—"
             key = (lp.ai_ch, lp.out_ch)
             hit = rt[lp.kind].get(key)
-            if hit:
-                _, ai, err, outv = hit
-                ai_val = f"{ai:.4f}" if (isinstance(ai, (int, float)) and math.isfinite(ai)) else "—"
-                err_val = f"{err:.4f}" if (isinstance(err, (int, float)) and math.isfinite(err)) else "—"
-                if lp.kind == "digital":
-                    out_val = str(int(bool(outv)))
-                else:
-                    out_val = f"{float(outv):.3f}" if (isinstance(outv, (int, float)) and math.isfinite(outv)) else "—"
 
-            for col, txt in [(4, ai_val), (6, err_val), (7, out_val)]:
+            if hit:
+                _, ai, u, outv = hit
+
+                # AI value
+                if isinstance(ai, (int, float)) and math.isfinite(ai):
+                    ai_val = f"{float(ai):.4f}"
+
+                # PID Result (control effort, pre-clamp for analog)
+                if isinstance(u, (int, float)) and math.isfinite(u):
+                    pid_val = f"{float(u):.4f}"
+
+                # OutputValue
+                if lp.kind == "digital":
+                    out_val = "—" if outv is None else str(int(bool(outv)))
+                else:
+                    if isinstance(outv, (int, float)) and math.isfinite(outv):
+                        out_val = f"{float(outv):.3f}"
+                    else:
+                        out_val = "—"
+
+            for col, txt in [(4, ai_val), (6, pid_val), (7, out_val)]:
                 it = self.pid_table.item(r, col)
                 if it is None:
                     it = QtWidgets.QTableWidgetItem()
@@ -1150,19 +1220,23 @@ def _pid_on_out_changed(self, row, val):
 def _pid_on_target_changed(self, row, val):
     try:
         self.pid_mgr.loops[row].target = float(val)
-        # no rebuild needed for tuning only
+        self.pid_mgr.apply_loop_updates(row)       # <-- push into live core
         self._pid_update_table_values()
+        # optional autosave:
+        # self.pid_mgr.save_file("PID.json")
     except Exception as e:
         self.log_rx(f"[PID] target change failed: {e}")
 
 def _pid_on_gain_changed(self, row, key, val):
     try:
         setattr(self.pid_mgr.loops[row], key, float(val))
-        # no full rebuild; core uses new gains next step, but to be safe:
-        self.pid_mgr.reset_states()
+        self.pid_mgr.apply_loop_updates(row)       # <-- push into live core
         self._pid_update_table_values()
+        # optional autosave:
+        # self.pid_mgr.save_file("PID.json")
     except Exception as e:
         self.log_rx(f"[PID] gain change failed: {e}")
+
 
 # ---- Bind the standalone PID handlers to MainWindow (so self._pid_* works) ----
 MainWindow._pid_rebuild = _pid_rebuild

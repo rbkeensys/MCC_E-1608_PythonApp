@@ -114,7 +114,7 @@
   "analogOutputs": [
     {
       "name": "AO0",
-      "minV": 0.0,
+      "minV": 1.0,
       "maxV": 10.0,
       "startupV": 0.0
     },
