@@ -23,6 +23,8 @@ class PIDLoopDef:
     err_max: Optional[float] = None
     i_min: Optional[float] = None       # clamp on integral term (already includes Ki)
     i_max: Optional[float] = None
+    # pid.py  (inside PIDLoopDef dataclass)
+    src: str = "ai"  # "ai" or "tc"  (NEW)
 
 # ---------- Core ----------
 class _PIDCore:
@@ -159,10 +161,13 @@ class PIDManager:
             "enabled","kind","ai_ch","out_ch","target","kp","ki","kd",
             "out_min","out_max","err_min","err_max","i_min","i_max"
         }
+        allowed = {..., "src", ...}
+
         for item in js.get("loops", []):
             # filter unknown keys so older/newer files don't break
             d = {k: item[k] for k in allowed if k in item}
             # required fallbacks if missing
+            d.setdefault("src", "ai")
             d.setdefault("enabled", True)
             d.setdefault("kind", "digital")
             d.setdefault("ai_ch", 0)
@@ -203,28 +208,30 @@ class PIDManager:
         for a in self.aloops: a.reset()
 
     # ----- processing -----
-    def process_block(self, ai_block_2d: np.ndarray, dt: float) -> Tuple[Dict[int,bool], Dict[int,float]]:
-        """
-        ai_block_2d: shape (nsamples, nch)
-        Returns: (do_updates, ao_updates) for this block (last-sample decisions).
-        """
-        if ai_block_2d.size == 0:
+    def process_block(self, ai_block_2d, dt: float, tc_block_2d=None):
+        if ai_block_2d is None and tc_block_2d is None:
             return {}, {}
-        ns, nch = ai_block_2d.shape
-        do_cmds: Dict[int,bool] = {}
-        ao_cmds: Dict[int,float] = {}
+        n_ai = 0 if ai_block_2d is None else ai_block_2d.shape[1]
+        n_tc = 0 if tc_block_2d is None else tc_block_2d.shape[1]
+        do_cmds, ao_cmds = {}, {}
 
-        # Digital loops
         for d in self.dloops:
-            if 0 <= d.defn.ai_ch < nch:
-                d.process_block(ai_block_2d[:, d.defn.ai_ch], dt)
-                do_cmds[d.defn.out_ch] = d.last_do_bit
+            lp = d.defn
+            if lp.src == "tc" and n_tc and 0 <= lp.ai_ch < n_tc:
+                d.process_block(tc_block_2d[:, lp.ai_ch], dt);
+                do_cmds[lp.out_ch] = d.last_do_bit
+            elif lp.src == "ai" and n_ai and 0 <= lp.ai_ch < n_ai:
+                d.process_block(ai_block_2d[:, lp.ai_ch], dt);
+                do_cmds[lp.out_ch] = d.last_do_bit
 
-        # Analog loops
         for a in self.aloops:
-            if 0 <= a.defn.ai_ch < nch:
-                a.process_block(ai_block_2d[:, a.defn.ai_ch], dt)
-                ao_cmds[a.defn.out_ch] = a.last_ao
+            lp = a.defn
+            if lp.src == "tc" and n_tc and 0 <= lp.ai_ch < n_tc:
+                a.process_block(tc_block_2d[:, lp.ai_ch], dt);
+                ao_cmds[lp.out_ch] = a.last_ao
+            elif lp.src == "ai" and n_ai and 0 <= lp.ai_ch < n_ai:
+                a.process_block(ai_block_2d[:, lp.ai_ch], dt);
+                ao_cmds[lp.out_ch] = a.last_ao
 
         return do_cmds, ao_cmds
 

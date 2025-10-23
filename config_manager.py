@@ -1,7 +1,8 @@
 import json
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Dict, Any
 
+# ---------- Channel configs ----------
 @dataclass
 class AnalogCfg:
     name: str = "AI"
@@ -9,6 +10,7 @@ class AnalogCfg:
     offset: float = 0.0
     cutoffHz: float = 0.0
     units: str = ""
+    include: bool = True
 
 @dataclass
 class DigitalOutCfg:
@@ -16,6 +18,7 @@ class DigitalOutCfg:
     normallyOpen: bool = True
     momentary: bool = False
     actuationTime: float = 0.0
+    include: bool = True
 
 @dataclass
 class AnalogOutCfg:
@@ -23,16 +26,67 @@ class AnalogOutCfg:
     minV: float = -10.0
     maxV: float = 10.0
     startupV: float = 0.0
+    include: bool = True
 
+# ---------- Boards ----------
 @dataclass
-class AppConfig:
+class Board1608Cfg:
     boardNum: int = 0
     sampleRateHz: float = 100.0
     blockSize: int = 64
+    aiMode: str = "SE"  # "SE" or "DIFF"
+
+@dataclass
+class BoardETCCfg:
+    boardNum: int = 0
+    sampleRateHz: float = 10.0
+    blockSize: int = 128
+
+# ---------- App config ----------
+@dataclass
+class AppConfig:
+    b1608: Board1608Cfg = field(default_factory=Board1608Cfg)
+    betc: BoardETCCfg = field(default_factory=BoardETCCfg)
     analogs: List[AnalogCfg] = field(default_factory=lambda: [AnalogCfg() for _ in range(8)])
     digitalOutputs: List[DigitalOutCfg] = field(default_factory=lambda: [DigitalOutCfg() for _ in range(8)])
     analogOutputs: List[AnalogOutCfg] = field(default_factory=lambda: [AnalogOutCfg() for _ in range(2)])
-    aiMode: str = "SE"
+    thermocouples: List[Dict[str, Any]] = field(default_factory=list)
+
+    # ---- Back-compat properties for existing code ----
+    @property
+    def boardNum(self) -> int:
+        return self.b1608.boardNum
+    @boardNum.setter
+    def boardNum(self, v: int): self.b1608.boardNum = int(v)
+
+    @property
+    def sampleRateHz(self) -> float:
+        return self.b1608.sampleRateHz
+    @sampleRateHz.setter
+    def sampleRateHz(self, v: float): self.b1608.sampleRateHz = float(v)
+
+    @property
+    def blockSize(self) -> int:
+        return self.b1608.blockSize
+    @blockSize.setter
+    def blockSize(self, v: int): self.b1608.blockSize = int(v)
+
+    @property
+    def aiMode(self) -> str:
+        return self.b1608.aiMode
+    @aiMode.setter
+    def aiMode(self, v: str): self.b1608.aiMode = (v or "SE").upper()
+
+    # Original dict-ish .etc for any legacy reads
+    @property
+    def etc(self) -> Dict[str, Any]:
+        return {"board": self.betc.boardNum, "sample_rate_hz": self.betc.sampleRateHz, "block_size": self.betc.blockSize}
+    @etc.setter
+    def etc(self, d: Dict[str, Any]):
+        if not d: return
+        self.betc.boardNum = int(d.get("board", self.betc.boardNum))
+        self.betc.sampleRateHz = float(d.get("sample_rate_hz", self.betc.sampleRateHz))
+        self.betc.blockSize = int(d.get("block_size", self.betc.blockSize))
 
 class ConfigManager:
     @staticmethod
@@ -40,11 +94,21 @@ class ConfigManager:
         with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
         cfg = AppConfig()
-        cfg.boardNum = raw.get("boardNum", raw.get("board", cfg.boardNum))
-        cfg.sampleRateHz = raw.get("sampleRateHz", raw.get("sampleRate", cfg.sampleRateHz))
-        cfg.blockSize = raw.get("blockSize", cfg.blockSize)
-        cfg.aiMode = (raw.get("aiMode") or "SE").upper()
-        if "analogs" in raw and isinstance(raw["analogs"], list):
+
+        # ----- Boards -----
+        b1608 = raw.get("board1608", {})
+        cfg.b1608.boardNum     = int(b1608.get("boardNum",  raw.get("boardNum",  raw.get("board", cfg.b1608.boardNum))))
+        cfg.b1608.sampleRateHz = float(b1608.get("sampleRateHz", raw.get("sampleRateHz", raw.get("sampleRate", cfg.b1608.sampleRateHz))))
+        cfg.b1608.blockSize    = int(b1608.get("blockSize", raw.get("blockSize", cfg.b1608.blockSize)))
+        cfg.b1608.aiMode       = (b1608.get("aiMode", raw.get("aiMode", cfg.b1608.aiMode)) or "SE").upper()
+
+        betc = raw.get("boardetc", {})
+        cfg.betc.boardNum      = int(betc.get("boardNum", cfg.betc.boardNum))
+        cfg.betc.sampleRateHz  = float(betc.get("sampleRateHz", cfg.betc.sampleRateHz))
+        cfg.betc.blockSize     = int(betc.get("blockSize", cfg.betc.blockSize))
+
+        # ----- Analogs -----
+        if isinstance(raw.get("analogs"), list):
             for i in range(min(8, len(raw["analogs"]))):
                 a = raw["analogs"][i] or {}
                 cfg.analogs[i] = AnalogCfg(
@@ -53,17 +117,10 @@ class ConfigManager:
                     offset=float(a.get("offset", 0.0)),
                     cutoffHz=float(a.get("cutoffHz", 0.0)),
                     units=a.get("units", ""),
+                    include=bool(a.get("include", True)),
                 )
-        else:
-            for i in range(8):
-                cfg.analogs[i] = AnalogCfg(
-                    name=raw.get(f"ai{i}Name", f"AI{i}"),
-                    slope=float(raw.get(f"ai{i}Slope", 1.0)),
-                    offset=float(raw.get(f"ai{i}Offset", 0.0)),
-                    cutoffHz=float(raw.get(f"ai{i}FilterCutoffHz", 0.0)),
-                    units=raw.get(f"ai{i}Units", ""),
-                )
-        if "digitalOutputs" in raw and isinstance(raw["digitalOutputs"], list):
+        # ----- Digital outputs -----
+        if isinstance(raw.get("digitalOutputs"), list):
             for i in range(min(8, len(raw["digitalOutputs"]))):
                 d = raw["digitalOutputs"][i] or {}
                 cfg.digitalOutputs[i] = DigitalOutCfg(
@@ -71,16 +128,10 @@ class ConfigManager:
                     normallyOpen=bool(d.get("normallyOpen", True)),
                     momentary=bool(d.get("momentary", False)),
                     actuationTime=float(d.get("actuationTime", 0.0)),
+                    include=bool(d.get("include", True)),
                 )
-        else:
-            for i in range(8):
-                cfg.digitalOutputs[i] = DigitalOutCfg(
-                    name=raw.get(f"do{i}Name", f"DO{i}"),
-                    normallyOpen=bool(raw.get(f"do{i}normallyOpen", True)),
-                    momentary=bool(raw.get(f"do{i}momentary", False)),
-                    actuationTime=float(raw.get(f"do{i}actuationTime", 0.0)),
-                )
-        if "analogOutputs" in raw and isinstance(raw["analogOutputs"], list):
+        # ----- Analog outputs -----
+        if isinstance(raw.get("analogOutputs"), list):
             for i in range(min(2, len(raw["analogOutputs"]))):
                 a = raw["analogOutputs"][i] or {}
                 cfg.analogOutputs[i] = AnalogOutCfg(
@@ -88,36 +139,42 @@ class ConfigManager:
                     minV=float(a.get("minV", -10.0)),
                     maxV=float(a.get("maxV", 10.0)),
                     startupV=float(a.get("startupV", 0.0)),
+                    include=bool(a.get("include", True)),
                 )
-        else:
-            for i in range(2):
-                cfg.analogOutputs[i] = AnalogOutCfg(
-                    name=raw.get(f"ao{i}Name", f"AO{i}"),
-                    minV=float(raw.get(f"ao{i}Min", -10.0)),
-                    maxV=float(raw.get(f"ao{i}Max", 10.0)),
-                    startupV=float(raw.get(f"ao{i}Default", 0.0)),
-                )
+
+        # ----- Thermocouples -----
+        if isinstance(raw.get("thermocouples"), list):
+            cfg.thermocouples = list(raw["thermocouples"])
+
         return cfg
 
     @staticmethod
-    def to_dict(cfg: 'AppConfig') -> dict:
+    def to_dict(cfg: 'AppConfig'):
         return {
-            "boardNum": cfg.boardNum,
-            "sampleRateHz": cfg.sampleRateHz,
-            "blockSize": cfg.blockSize,
-            "aiMode": cfg.aiMode,
+            "board1608": {
+                "boardNum": cfg.b1608.boardNum,
+                "sampleRateHz": cfg.b1608.sampleRateHz,
+                "blockSize": cfg.b1608.blockSize,
+                "aiMode": cfg.b1608.aiMode,
+            },
+            "boardetc": {
+                "boardNum": cfg.betc.boardNum,
+                "sampleRateHz": cfg.betc.sampleRateHz,
+                "blockSize": cfg.betc.blockSize,
+            },
             "analogs": [
-                {"name": a.name, "slope": a.slope, "offset": a.offset, "cutoffHz": a.cutoffHz, "units": a.units}
+                {"name": a.name, "slope": a.slope, "offset": a.offset, "cutoffHz": a.cutoffHz, "units": a.units, "include": a.include}
                 for a in cfg.analogs
             ],
             "digitalOutputs": [
-                {"name": d.name, "normallyOpen": d.normallyOpen, "momentary": d.momentary, "actuationTime": d.actuationTime}
+                {"name": d.name, "normallyOpen": d.normallyOpen, "momentary": d.momentary, "actuationTime": d.actuationTime, "include": d.include}
                 for d in cfg.digitalOutputs
             ],
             "analogOutputs": [
-                {"name": a.name, "minV": a.minV, "maxV": a.maxV, "startupV": a.startupV}
+                {"name": a.name, "minV": a.minV, "maxV": a.maxV, "startupV": a.startupV, "include": a.include}
                 for a in cfg.analogOutputs
             ],
+            "thermocouples": cfg.thermocouples,
         }
 
     @staticmethod

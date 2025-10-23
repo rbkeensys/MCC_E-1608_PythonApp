@@ -27,6 +27,7 @@ except Exception:
     DLG_ACCEPTED = QtWidgets.QDialog.Accepted             # PyQt5
 
 from typing import Optional
+from etc_device import ETCDevice
 from config_manager import ConfigManager, AppConfig
 from daq_driver import DaqDriver, DaqError
 from filters import OnePoleLPF
@@ -41,146 +42,226 @@ from combined_chart import CombinedChartWindow
 from bisect import bisect_left
 
 class PIDSetupDialog(QtWidgets.QDialog):
-    COLS = ["Enable","Type","AI ch","OUT ch","Target","P","I","D",
-            "ErrMin","ErrMax","IMin","IMax"]  # NEW clamp columns
-
-    def __init__(self, parent=None, existing=None):
+    """
+    Editor for PID loops with:
+      - Enable
+      - Type (Digital PID / Analog PID)   [derived from output selector]
+      - Source (ai | tc)
+      - AI ch
+      - OUT (D0..D7, A0..A1)              [changes kind+out_ch]
+      - Target, P, I, D
+      - Clamps (ErrMin, ErrMax, IMin, IMax, OutMin, OutMax for analog)
+      - Add / Remove
+    """
+    def __init__(self, pid_mgr, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("PID Setup")
-        self.resize(800, 360)
+        from PyQt6 import QtGui
+        self.setWindowTitle("Edit PID Loops")
+        self.resize(980, 520)
+        self.pid_mgr = pid_mgr
+
         v = QtWidgets.QVBoxLayout(self)
-        self.table = QtWidgets.QTableWidget(8, len(self.COLS), self)
-        self.table.setHorizontalHeaderLabels(self.COLS)
+
+        # Table
+        self.table = QtWidgets.QTableWidget(self)
+        self.table.setColumnCount(14)
+        self.table.setHorizontalHeaderLabels([
+            "Enable","Type","Source","AI ch","OUT (D/A)","Target","P","I","D",
+            "ErrMin","ErrMax","IMin","IMax","OutMin/Max"
+        ])
         self.table.horizontalHeader().setStretchLastSection(True)
         v.addWidget(self.table)
 
-        btns = QtWidgets.QHBoxLayout()
-        self.btn_load = QtWidgets.QPushButton("Load PID.json")
-        self.btn_save = QtWidgets.QPushButton("Save PID.json")
+        # Buttons row
+        hb = QtWidgets.QHBoxLayout()
+        hb.addStretch(1)
+        self.btn_add = QtWidgets.QPushButton("Add")
+        self.btn_remove = QtWidgets.QPushButton("Remove")
         self.btn_ok = QtWidgets.QPushButton("OK")
         self.btn_cancel = QtWidgets.QPushButton("Cancel")
-        btns.addWidget(self.btn_load); btns.addWidget(self.btn_save)
-        btns.addStretch(1)
-        btns.addWidget(self.btn_ok); btns.addWidget(self.btn_cancel)
-        v.addLayout(btns)
+        hb.addWidget(self.btn_add); hb.addWidget(self.btn_remove)
+        hb.addSpacing(16)
+        hb.addWidget(self.btn_ok); hb.addWidget(self.btn_cancel)
+        v.addLayout(hb)
 
-        self.btn_load.clicked.connect(self._on_load)
-        self.btn_save.clicked.connect(self._on_save)
+        self.btn_add.clicked.connect(self._on_add)
+        self.btn_remove.clicked.connect(self._on_remove)
         self.btn_ok.clicked.connect(self.accept)
         self.btn_cancel.clicked.connect(self.reject)
 
-        # Pre-fill from existing PIDManager.loops
-        if existing:
-            for r, lp in enumerate(existing[:8]):
-                self._set_row(r, lp)
+        # Fill rows from manager loops
+        self._refresh_from_mgr()
 
-    def _set_row(self, r, lp):
-        def cb(val, checked=True):  # helper
-            w = QtWidgets.QCheckBox(); w.setChecked(val); return w
-        def combo(val):
-            w = QtWidgets.QComboBox(); w.addItems(["digital","analog"])
-            w.setCurrentText(val); return w
-        def spin(v, lo=0, hi=7, step=1):
-            w = QtWidgets.QSpinBox(); w.setRange(lo, hi); w.setValue(int(v)); w.setSingleStep(step); return w
-        def dspin(v, lo=-1e9, hi=1e9, step=0.1):
-            w = QtWidgets.QDoubleSpinBox(); w.setRange(lo, hi); w.setDecimals(4); w.setSingleStep(step); w.setValue(float(v)); return w
+    # ---------- helpers ----------
+    def _refresh_from_mgr(self):
+        loops = getattr(self.pid_mgr, "loops", [])
+        self.table.setRowCount(len(loops))
+        for r, lp in enumerate(loops):
+            self._fill_row(r, lp)
 
-        items = [
-            cb(lp.enabled),
-            combo(lp.kind),
-            spin(lp.ai_ch, 0, 7, 1),
-            spin(lp.out_ch, 0, 7 if lp.kind=="digital" else 1, 1),
-            dspin(lp.target),
-            dspin(lp.kp), dspin(lp.ki), dspin(lp.kd)
-        ]
-        for c, w in enumerate(items):
-            self.table.setCellWidget(r, c, w)
+    def _fill_row(self, r, lp):
+        # Enable
+        cb_en = QtWidgets.QCheckBox()
+        cb_en.setChecked(bool(getattr(lp, "enabled", True)))
+        cb_en.stateChanged.connect(lambda _s, row=r: self._on_enable(row))
+        self.table.setCellWidget(r, 0, cb_en)
 
-        # ErrMin / ErrMax
-        dsp_emn = QtWidgets.QDoubleSpinBox(); dsp_emn.setDecimals(4); dsp_emn.setRange(-1e9, 1e9); dsp_emn.setSingleStep(0.1)
-        dsp_emx = QtWidgets.QDoubleSpinBox(); dsp_emx.setDecimals(4); dsp_emx.setRange(-1e9, 1e9); dsp_emx.setSingleStep(0.1)
-        dsp_emn.setValue(float(lp.err_min) if lp.err_min is not None else 0.0)
-        dsp_emx.setValue(float(lp.err_max) if lp.err_max is not None else 0.0)
-        # Use checkbox-like enable? To keep simple, interpret 0==unset if both 0 and user wants no clamp
+        # Type (derived; read-only label)
+        typ = "Digital PID" if lp.kind == "digital" else "Analog PID"
+        it_typ = QtWidgets.QTableWidgetItem(typ)
+        it_typ.setFlags(it_typ.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+        self.table.setItem(r, 1, it_typ)
 
-        # IMin / IMax
-        dsp_imn = QtWidgets.QDoubleSpinBox(); dsp_imn.setDecimals(4); dsp_imn.setRange(-1e9, 1e9); dsp_imn.setSingleStep(0.1)
-        dsp_imx = QtWidgets.QDoubleSpinBox(); dsp_imx.setDecimals(4); dsp_imx.setRange(-1e9, 1e9); dsp_imx.setSingleStep(0.1)
-        dsp_imn.setValue(float(lp.i_min) if lp.i_min is not None else 0.0)
-        dsp_imx.setValue(float(lp.i_max) if lp.i_max is not None else 0.0)
+        # Source (ai|tc)
+        src_cb = QtWidgets.QComboBox()
+        src_cb.addItems(["ai","tc"])
+        src_cb.setCurrentText(getattr(lp, "src", "ai"))
+        src_cb.currentTextChanged.connect(lambda _t, row=r: self._on_src(row))
+        self.table.setCellWidget(r, 2, src_cb)
 
-        # place in columns 8..11
-        self.table.setCellWidget(r, 8, dsp_emn)
-        self.table.setCellWidget(r, 9, dsp_emx)
-        self.table.setCellWidget(r, 10, dsp_imn)
-        self.table.setCellWidget(r, 11, dsp_imx)
+        # AI channel
+        sp_ai = QtWidgets.QSpinBox(); sp_ai.setRange(0, 31); sp_ai.setValue(int(lp.ai_ch))
+        sp_ai.valueChanged.connect(lambda _v, row=r: self._on_ai(row))
+        self.table.setCellWidget(r, 3, sp_ai)
 
-    def _row_to_def(self, r) -> Optional[dict]:
-        def getw(c): return self.table.cellWidget(r, c)
-        if not self.table.cellWidget(r, 0):  # empty row
-            return None
-        enabled = getw(0).isChecked()
-        kind = getw(1).currentText()
-        ai = getw(2).value()
-        out = getw(3).value()
-        target = getw(4).value()
-        kp = getw(5).value()
-        ki = getw(6).value()
-        kd = getw(7).value()
-        err_min = self.table.cellWidget(r, 8).value()
-        err_max = self.table.cellWidget(r, 9).value()
-        i_min = self.table.cellWidget(r, 10).value()
-        i_max = self.table.cellWidget(r, 11).value()
+        # OUT (D0..D7, A0..A1)
+        out_combo = QtWidgets.QComboBox()
+        for i in range(8): out_combo.addItem(f"D{i}")
+        for i in range(2): out_combo.addItem(f"A{i}")
+        # set current based on lp.kind/out_ch
+        cur = f"{'D' if lp.kind=='digital' else 'A'}{int(lp.out_ch)}"
+        idx = out_combo.findText(cur)
+        out_combo.setCurrentIndex(max(0, idx))
+        out_combo.currentTextChanged.connect(lambda _t, row=r: self._on_out(row))
+        self.table.setCellWidget(r, 4, out_combo)
 
-        # normalize zeros to None (no clamp) if both ends are 0
-        def nz(x):
-            return None if (abs(float(x)) < 1e-12) else float(x)
+        # Target, P, I, D
+        for col, val in [(5, lp.target), (6, lp.kp), (7, lp.ki), (8, lp.kd)]:
+            self.table.setItem(r, col, self._num_item(val))
 
-        d = dict(
-            enabled=enabled, kind=kind, ai_ch=ai, out_ch=out,
-            target=target, kp=kp, ki=ki, kd=kd,
-            err_min=nz(err_min), err_max=nz(err_max),
-            i_min=nz(i_min), i_max=nz(i_max)
-        )
-        if kind == "analog":
-            d["out_min"] = -10.0
-            d["out_max"] = 10.0
-        return d
+        # ErrMin/ErrMax, IMin/IMax
+        self.table.setItem(r, 9,  self._maybe_num_item(getattr(lp, "err_min", None)))
+        self.table.setItem(r, 10, self._maybe_num_item(getattr(lp, "err_max", None)))
+        self.table.setItem(r, 11, self._maybe_num_item(getattr(lp, "i_min", None)))
+        self.table.setItem(r, 12, self._maybe_num_item(getattr(lp, "i_max", None)))
 
-    def values(self):
-        vals = []
+        # OutMin/Max (analog only) — show as text "lo..hi" for convenience
+        if lp.kind == "analog":
+            lo = getattr(lp, "out_min", None)
+            hi = getattr(lp, "out_max", None)
+            txt = "" if (lo is None and hi is None) else f"{'' if lo is None else lo}..{'' if hi is None else hi}"
+        else:
+            txt = ""  # not applicable to digital
+        self.table.setItem(r, 13, QtWidgets.QTableWidgetItem(txt))
+
+    @staticmethod
+    def _num_item(val) -> QtWidgets.QTableWidgetItem:
+        it = QtWidgets.QTableWidgetItem(f"{float(val):.6g}")
+        it.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        return it
+
+    @staticmethod
+    def _maybe_num_item(val) -> QtWidgets.QTableWidgetItem:
+        if val is None or (isinstance(val, str) and val.strip() == ""):
+            return QtWidgets.QTableWidgetItem("")
+        try:
+            f = float(val)
+            return PIDSetupDialog._num_item(f)
+        except Exception:
+            return QtWidgets.QTableWidgetItem(str(val))
+
+    # ---------- row ops ----------
+    def _on_add(self):
+        from pid import PIDLoopDef
+        loops = self.pid_mgr.loops
+        # default new as digital on DO0
+        new = PIDLoopDef(kind="digital", enabled=True, src="ai",
+                         ai_ch=0, out_ch=0, target=0.0, kp=1.0, ki=0.0, kd=0.0)
+        loops.append(new)
+        self.table.insertRow(self.table.rowCount())
+        self._fill_row(self.table.rowCount()-1, new)
+
+    def _on_remove(self):
+        r = self.table.currentRow()
+        if r < 0 or r >= self.table.rowCount(): return
+        del self.pid_mgr.loops[r]
+        self.table.removeRow(r)
+
+    # ---------- cell handlers (write-through to pid_mgr.loops) ----------
+    def _loop_at(self, row):
+        loops = getattr(self.pid_mgr, "loops", [])
+        if 0 <= row < len(loops): return loops[row]
+        return None
+
+    def _on_enable(self, row):
+        lp = self._loop_at(row);  lp.enabled = bool(self.table.cellWidget(row, 0).isChecked())
+
+    def _on_src(self, row):
+        lp = self._loop_at(row);  lp.src = str(self.table.cellWidget(row, 2).currentText())
+
+    def _on_ai(self, row):
+        lp = self._loop_at(row);  lp.ai_ch = int(self.table.cellWidget(row, 3).value())
+
+    def _on_out(self, row):
+        """Parse Dn/Am and update kind + out_ch + type label."""
+        lp = self._loop_at(row)
+        txt = str(self.table.cellWidget(row, 4).currentText())
+        if txt and txt[0] in ("D","A"):
+            k = "digital" if txt[0] == "D" else "analog"
+            ch = int(txt[1:])
+            lp.kind = k
+            lp.out_ch = ch
+            # update type label column (col 1)
+            it = self.table.item(row, 1)
+            if it: it.setText("Digital PID" if k=="digital" else "Analog PID")
+
+    # ---------- collect back to pid_mgr ----------
+    def accept(self):
+        # Pull scalar columns into loop defs, preserving previous values on blanks
         for r in range(self.table.rowCount()):
-            d = self._row_to_def(r)
-            if d is not None:
-                # Ignore completely empty (all defaults) rows
-                if (not d["enabled"]) and d["kp"]==0 and d["ki"]==0 and d["kd"]==0:
-                    continue
-                vals.append(d)
-        return vals
+            lp = self._loop_at(r)
 
-    def _on_load(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load PID.json", "", "JSON (*.json)")
-        if not path: return
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                js = json.load(f)
-            loops = js.get("loops", [])
-            self.table.clearContents()
-            self.table.setRowCount(max(8, len(loops)))
-            for r, item in enumerate(loops[:8]):
-                from pid import PIDLoopDef
-                self._set_row(r, PIDLoopDef(**item))
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "PID load error", str(e))
+            def _getf(c, current):
+                it = self.table.item(r, c)
+                if it is None:
+                    return current
+                txt = (it.text() or "").strip()
+                if txt == "":
+                    return current
+                try:
+                    return float(txt)
+                except Exception:
+                    return current
 
-    def _on_save(self):
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save PID.json", "PID.json", "JSON (*.json)")
-        if not path: return
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump({"loops": self.values()}, f, indent=2)
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "PID save error", str(e))
+            lp.target = _getf(5, getattr(lp, "target", 0.0))
+            lp.kp = _getf(6, getattr(lp, "kp", 1.0))
+            lp.ki = _getf(7, getattr(lp, "ki", 0.0))
+            lp.kd = _getf(8, getattr(lp, "kd", 0.0))
+            lp.err_min = _getf(9, getattr(lp, "err_min", None))
+            lp.err_max = _getf(10, getattr(lp, "err_max", None))
+            lp.i_min = _getf(11, getattr(lp, "i_min", None))
+            lp.i_max = _getf(12, getattr(lp, "i_max", None))
+
+            # parse OutMin/Max "lo..hi"
+            it = self.table.item(r, 13)
+            txt = (it.text() if it else "").strip()
+            lo = getattr(lp, "out_min", None)
+            hi = getattr(lp, "out_max", None)
+            if txt:
+                parts = txt.split("..")
+                try:
+                    lo = float(parts[0]) if parts[0] != "" else lo
+                except Exception:
+                    pass
+                try:
+                    hi = float(parts[1]) if len(parts) > 1 and parts[1] != "" else hi
+                except Exception:
+                    pass
+            lp.out_min = lo
+            lp.out_max = hi
+
+        super().accept()
+
 
 class ScaleDialog(QtWidgets.QDialog):
     def __init__(self, parent, idx, y_min, y_max):
@@ -227,7 +308,7 @@ class ScaleDialog(QtWidgets.QDialog):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MCC E-1608 Control")
+        self.setWindowTitle("MCC Control")
         self.resize(1300, 800)
 
         # Core state
@@ -246,6 +327,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.script_events = []
 
         self.do_state = [False] * 8  # <-- add: current DO state for plotting
+
+        # --- E-TC / Thermocouples state ---
+        self.etc = None                  # ETCDevice (if you wire it later)
+        self.tc_enabled = []             # list[int] of TC channel indexes (per config order)
+        self.tc_types = []               # list[str] like "K","J",...
+        self.tc_names = []               # list[str] display names
+        self.tc_include = []             # list[bool] include in charts
+        self.tc_hist_y = []              # list[deque] histories per TC channel (aligned to ai_hist_x)
+        self.tc_titles = []              # list[str] "Name (TCx Type)"
 
         # Windows
         self.analog_win = AnalogChartWindow(
@@ -300,13 +390,31 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.log_rx("[INFO] No default script.json found")
         except Exception as e:
             self.log_rx(f"[WARN] Could not auto-load defaults: {e}")
+            self.log_rx(f"[WARN] Could not auto-load defaults: {e}")
+
+        try:
+            etc_cfg = getattr(self.cfg, "etc", None)
+            if etc_cfg:
+                self.etc = ETCDevice(board=int(etc_cfg.get("board", 0)),
+                                     sample_rate_hz=float(etc_cfg.get("sample_rate_hz", 10)))
+                if self.etc.connect():
+                    self.log_rx(f"[INFO] E-TC connected (board={self.etc.board}, {self.etc.rate:.1f} Hz)")
+                else:
+                    self.log_rx("[WARN] E-TC not connected")
+        except Exception as e:
+            self.log_rx(f"[WARN] E-TC init failed: {e}")
 
         self.pid_mgr = PIDManager(self)
-        # Try to autoload PID.json (optional)
+        # Try auto-load PID.json (do not error if missing)
         try:
+            import os
             if os.path.exists("PID.json"):
                 self.pid_mgr.load_file("PID.json")
-                self.log_rx("[INFO] Loaded PID.json")
+                self.pid_path = "PID.json"
+                # refresh any on-screen PID pane
+                self._pid_refresh_table_structure()
+                self._pid_update_table_values()
+                self.log_rx("[INFO] PID.json loaded.")
         except Exception as e:
             self.log_rx(f"[WARN] PID.json load failed: {e}")
 
@@ -369,6 +477,11 @@ class MainWindow(QtWidgets.QMainWindow):
         rate = max(1.0, self._effective_rate_hz())
         return int(math.ceil(rate * float(span_s) * self._history_headroom))
 
+    def _mk_deque(self):
+        """Deque sized to current span & rate."""
+        cap = max(256, self._target_history_len(self.time_window_s))
+        return deque(maxlen=cap)
+
     def _rebuild_histories_for_span(self):
         """Ensure histories can hold the full span at current rate (with headroom)."""
         cap = max(256, self._target_history_len(self.time_window_s))
@@ -393,6 +506,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # AO (if you track them)
         self.ao_hist_y = [redq(ch, cap) for ch in getattr(self, "ao_hist_y", [[] for _ in range(2)])]
 
+        # TC (if present)
+        if hasattr(self, "tc_hist_y") and self.tc_hist_y:
+            self.tc_hist_y = [redq(ch, cap) for ch in self.tc_hist_y]
+
     def _on_span_changed(self, seconds: float):
         """User changed X-span in either window: sync both + ensure buffers can hold it."""
         self.time_window_s = float(seconds)
@@ -411,19 +528,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_menu(self):
         m=self.menuBar(); f=m.addMenu("&File")
-        f.addAction("Load Config...", self._act_load_cfg);
-        f.addAction("Save Config As...", self._act_save_cfg);
+        f.addAction("Load Config...", self._act_load_cfg)
+        f.addAction("Save Config As...", self._act_save_cfg)
         f.addAction("Edit Config...", self._act_edit_cfg)
-        f.addSeparator();
-        f.addAction("Load Script...", self._act_load_script);
-        f.addAction("Save Script As...", self._act_save_script);
+        f.addSeparator()
+        f.addAction("Load Script...", self._act_load_script)
+        f.addAction("Save Script As...", self._act_save_script)
         f.addAction("Edit Script...", self._act_edit_script)
         f.addSeparator();
+        f.addAction("Edit TCs...", self._act_edit_tc)
+        f.addSeparator()
         f.addAction("Quit", self.close)
-        v=m.addMenu("&View");
-        v.addAction("Show Analog Charts", self.analog_win.show);
-        v.addAction("Show Digital Chart", self.digital_win.show);
+        v=m.addMenu("&View")
+        v.addAction("Show Analog Charts", self.analog_win.show)
+        v.addAction("Show Digital Chart", self.digital_win.show)
         v.addAction("Show Combined Chart", self.combined_win.show)
+        v.addAction("Show Thermocouple Chart", self._open_tc_window)
 
         # ---- PID Menu ----
         pid_menu = self.menuBar().addMenu("&PID")
@@ -524,6 +644,7 @@ class MainWindow(QtWidgets.QMainWindow):
             [a.name for a in self.cfg.analogs],
             [a.units for a in self.cfg.analogs],
         )
+
         for i in range(8):
             nm = None
             # Try a few common layouts; keep whatever matches your Config class
@@ -555,6 +676,111 @@ class MainWindow(QtWidgets.QMainWindow):
                 ao_units.append(u)
 
             self.combined_win.set_ao_names_units(ao_names, ao_units)
+
+            # --- Thermocouples (E-TC) from cfg ---
+            tcs = getattr(self.cfg, "thermocouples", [])
+            self.tc_enabled, self.tc_types, self.tc_names, self.tc_include = [], [], [], []
+            self.tc_hist_y = []
+            for item in tcs:
+                ch = int(item.get("ch", 0))
+                name = str(item.get("name", f"TC{ch}"))
+                ttype = str(item.get("type", "K")).upper()
+                include = bool(item.get("include", True))
+                self.tc_enabled.append(ch)
+                self.tc_types.append(ttype)
+                self.tc_names.append(name)
+                self.tc_include.append(include)
+                self.tc_hist_y.append(self._mk_deque())
+
+            self.tc_titles = [f"{self.tc_names[i]} (TC{self.tc_enabled[i]} {self.tc_types[i]})" for i in
+                              range(len(self.tc_enabled))]
+
+            # Keep TC titles in any existing windows
+            if hasattr(self, "tc_win") and self.tc_win:
+                self.tc_win.set_names_units(self.tc_titles, ["°C"] * len(self.tc_titles))
+            if hasattr(self, "combined_win") and self.combined_win and hasattr(self.combined_win, "set_tc_names_units"):
+                self.combined_win.set_tc_names_units(self.tc_titles, ["°C"] * len(self.tc_titles))
+
+        # ---- Cache names (used by charts & combined) ----
+        # AI
+        try:
+            self.ai_names = [a.name if getattr(a, "name", None) else f"AI{i}" for i, a in enumerate(self.cfg.analogs)]
+        except Exception:
+            self.ai_names = [f"AI{i}" for i in range(8)]
+
+        # DO
+        try:
+            self.do_names = [d.name if getattr(d, "name", None) else f"DO{i}" for i, d in
+                             enumerate(self.cfg.digitalOutputs)]
+        except Exception:
+            self.do_names = [f"DO{i}" for i in range(8)]
+
+        # AO
+        try:
+            self.ao_names = [a.name if getattr(a, "name", None) else f"AO{i}" for i, a in
+                             enumerate(self.cfg.analogOutputs)]
+        except Exception:
+            self.ao_names = [f"AO{i}" for i in range(2)]
+
+        # --- Thermocouples from config (optional) ---
+        tcs = getattr(self.cfg, "thermocouples", [])
+        # reset TC lists every time we apply config
+        self.tc_enabled, self.tc_types, self.tc_names, self.tc_include = [], [], [], []
+        self.tc_hist_y = []
+        for item in tcs:
+            ch = int(item.get("ch", 0))
+            name = str(item.get("name", f"TC{ch}"))
+            ttype = str(item.get("type", "K")).upper()
+            include = bool(item.get("include", True))
+            self.tc_enabled.append(ch)
+            self.tc_types.append(ttype)
+            self.tc_names.append(name)
+            self.tc_include.append(include)
+            self.tc_hist_y.append(self._mk_deque())
+
+        # Titles like "MyProbe (TC0 K)"
+        self.tc_titles = [
+            f"{self.tc_names[i]} (TC{self.tc_enabled[i]} {self.tc_types[i]})"
+            for i in range(len(self.tc_enabled))
+        ]
+
+        # If TC windows exist, refresh their titles (safe no-ops if they don't)
+        if hasattr(self, "tc_win") and self.tc_win:
+            self.tc_win.set_names_units(self.tc_titles, ["°C"] * len(self.tc_titles))
+        if hasattr(self, "combined_win") and self.combined_win:
+            if hasattr(self.combined_win, "set_tc_names_units"):
+                self.combined_win.set_tc_names_units(self.tc_titles, ["°C"] * len(self.tc_titles))
+
+
+        # --- Thermocouples from config ---
+        tcs = getattr(self.cfg, "thermocouples", [])
+        self.tc_enabled.clear();
+        self.tc_types.clear();
+        self.tc_names.clear();
+        self.tc_include.clear();
+        self.tc_hist_y.clear()
+
+        for item in tcs:
+            ch = int(item.get("ch", 0))
+            name = str(item.get("name", f"TC{ch}"))
+            ttype = str(item.get("type", "K")).upper()
+            include = bool(item.get("include", True))
+            self.tc_enabled.append(ch)
+            self.tc_types.append(ttype)
+            self.tc_names.append(name)
+            self.tc_include.append(include)
+            self.tc_hist_y.append(self._mk_deque())  # same length as AI histories
+
+        # Make pretty series titles like "TC0 (K) — Name"
+        self.tc_titles = [f"{self.tc_names[i]} (TC{self.tc_enabled[i]} {self.tc_types[i]})"
+                          for i in range(len(self.tc_enabled))]
+
+        if hasattr(self, "tc_win") and self.tc_win:
+            self.tc_win.set_names_units(self.tc_titles, ["°C"] * len(self.tc_titles))
+        if hasattr(self, "combined_win") and self.combined_win:
+            # prepare combined for TC names (section is created dynamically on first data)
+            if hasattr(self.combined_win, "set_tc_names_units"):
+                self.combined_win.set_tc_names_units(self.tc_titles, ["°C"] * len(self.tc_titles))
 
     def _act_apply_config(self):
         """Re-apply the current in-memory config to UI and, if connected, to the device."""
@@ -671,24 +897,101 @@ class MainWindow(QtWidgets.QMainWindow):
         ConfigManager.save(path,self.cfg); self.log_rx(f"Saved config: {path}")
 
     def _act_edit_cfg(self):
-        dlg=ConfigEditorDialog(self,self.cfg)
-        if dlg.exec():
-            self.cfg=dlg.updated_config(); self.sample_period = 1.0 / max(1e-6, self.cfg.sampleRateHz); self._apply_cfg_to_ui()
-            self._rebuild_histories_for_span()
+        from config_editor import ConfigEditorDialog
+        # snapshot for change detection
+        try:
+            from config_manager import ConfigManager
+            import copy
+            before = ConfigManager.to_dict(self.cfg)
+        except Exception:
+            before = None
+
+        dlg = ConfigEditorDialog(self.cfg, self)
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            self.cfg = dlg.result_config()
+            self._apply_cfg_to_ui()
+
+            changed = True
+            try:
+                after = ConfigManager.to_dict(self.cfg)
+                changed = (before is None) or (after != before)
+            except Exception:
+                changed = True
+
+            if changed:
+                mb = QtWidgets.QMessageBox(self)
+                mb.setWindowTitle("Save Config?")
+                mb.setText("Configuration has changed. Do you want to save it?")
+                mb.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Save |
+                                      QtWidgets.QMessageBox.StandardButton.Discard |
+                                      QtWidgets.QMessageBox.StandardButton.Cancel)
+                mb.setDefaultButton(QtWidgets.QMessageBox.StandardButton.Save)
+                res = mb.exec()
+                if res == QtWidgets.QMessageBox.StandardButton.Save:
+                    # save to last known config path or ask
+                    path = getattr(self, "config_path", None)
+                    if not path:
+                        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Config As...", "config.json",
+                                                                        "JSON (*.json)")
+                    if path:
+                        try:
+                            from config_manager import ConfigManager
+                            ConfigManager.save(path, self.cfg)
+                            self.config_path = path
+                            self.log_rx(f"[INFO] Config saved to {path}")
+                        except Exception as e:
+                            QtWidgets.QMessageBox.critical(self, "Config save error", str(e))
+                elif res == QtWidgets.QMessageBox.StandardButton.Cancel:
+                    return
+
+    def _act_edit_tc(self):
+        from config_editor import ConfigEditorDialog
+        dlg = ConfigEditorDialog(self.cfg, self)  # cfg first, parent second
+        # jump to the TC tab if present
+        try:
+            tabs = dlg.findChild(QtWidgets.QTabWidget)
+            if tabs:
+                for i in range(tabs.count()):
+                    if "thermocouple" in tabs.tabText(i).lower():
+                        tabs.setCurrentIndex(i)
+                        break
+        except Exception:
+            pass
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            self.cfg = dlg.result_config()
+            self._apply_cfg_to_ui()
 
     def _act_load_script(self, path=None, show_editor=True):
+        #path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load Script", "", "JSON (*.json)")
         if not path:
             path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load script.json", "", "JSON (*.json)")
-            if not path:
-                return
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                self.script_events = json.load(f)
-            self.log_rx(f"Loaded script: {path}")
-            if show_editor:
-                self._act_edit_script()
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Script error", str(e))
+        if not path:
+            self.log_rx(f"[INFO] Load script file, path fail")
+            return
+        import json
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # Critical: update the exact attribute(s) your editor uses
+        self.script_path = path
+        # Assign to both common names so runner + editor see the same object
+        self.script_events = data
+        self.script_model = data
+
+        # Kick whatever table your UI already has (try common names, no new helpers)
+        for fn in ("_script_refresh_table_structure",
+                   "_script_refresh_table",
+                   "_rebuild_script_table",
+                   "_script_to_ui",
+                   "_update_script_table"):
+            if hasattr(self, fn):
+                try:
+                    getattr(self, fn)()
+                    break
+                except Exception:
+                    pass
+        self.log_rx(f"[INFO] Script loaded: {path}")
+        self._act_edit_script()
 
     def _act_save_script(self):
         path,_=QtWidgets.QFileDialog.getSaveFileName(self,"Save script.json","script.json","JSON (*.json)")
@@ -699,8 +1002,93 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e: QtWidgets.QMessageBox.critical(self,"Save error",str(e))
 
     def _act_edit_script(self):
-        dlg=ScriptEditorDialog(self,self.script_events)
-        if dlg.exec(): self.script_events=dlg.result_events()
+        # Build the dialog safely without guessing the ctor order
+        dlg = None
+        try:
+            from script_editor import ScriptEditorDialog
+        except Exception:
+            QtWidgets.QMessageBox.critical(self, "Error", "script_editor.py not found")
+            return
+
+        model = getattr(self, "script_model", {})  # whatever you store the script in
+
+        # Try common signatures in a safe order
+        try:
+            # (parent, model)
+            dlg = ScriptEditorDialog(self, model)
+        except TypeError:
+            try:
+                # (model, parent)
+                dlg = ScriptEditorDialog(model, self)
+            except TypeError:
+                try:
+                    # (parent) only
+                    dlg = ScriptEditorDialog(self)
+                except TypeError:
+                    # () only, then try to inject later
+                    dlg = ScriptEditorDialog()
+
+        # If dialog has a setter, inject the model
+        for setter in ("set_model", "set_script", "load_script", "setData"):
+            if hasattr(dlg, setter):
+                try:
+                    getattr(dlg, setter)(model)
+                    break
+                except Exception:
+                    pass
+
+        # Snapshot to detect changes
+        try:
+            import json
+            before = json.dumps(model, sort_keys=True)
+        except Exception:
+            before = None
+
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            # Pull result back if dialog exposes a getter
+            new_model = None
+            for getter in ("result_script", "get_model", "get_script", "data"):
+                if hasattr(dlg, getter):
+                    try:
+                        new_model = getattr(dlg, getter)()
+                        break
+                    except Exception:
+                        pass
+            if new_model is not None:
+                self.script_model = new_model
+
+            changed = True
+            try:
+                import json
+                after = json.dumps(self.script_model, sort_keys=True)
+                changed = (before is None) or (after != before)
+            except Exception:
+                changed = True
+
+            if changed:
+                mb = QtWidgets.QMessageBox(self)
+                mb.setWindowTitle("Save Script?")
+                mb.setText("Script has changed. Do you want to save it?")
+                mb.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Save |
+                                      QtWidgets.QMessageBox.StandardButton.Discard |
+                                      QtWidgets.QMessageBox.StandardButton.Cancel)
+                mb.setDefaultButton(QtWidgets.QMessageBox.StandardButton.Save)
+                res = mb.exec()
+                if res == QtWidgets.QMessageBox.StandardButton.Save:
+                    # Save to current path if you have one; otherwise reuse your existing menu handler
+                    spath = getattr(self, "script_path", None)
+                    if spath:
+                        try:
+                            import json
+                            with open(spath, "w", encoding="utf-8") as f:
+                                json.dump(self.script_model, f, indent=2)
+                            self.log_rx(f"[INFO] Script saved to {spath}")
+                        except Exception as e:
+                            QtWidgets.QMessageBox.critical(self, "Script save error", str(e))
+                    else:
+                        self._act_save_script()
+                elif res == QtWidgets.QMessageBox.StandardButton.Cancel:
+                    return
 
     def _act_pid_load_json(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load PID.json", "", "JSON (*.json)")
@@ -746,6 +1134,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
             self.daq.disconnect()
             self.daq = None
+            self.etc = None
             self.btn_connect.setText("Connect")
             return
 
@@ -761,6 +1150,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
             # Start hardware scan
             actual_rate = self.daq.start_ai_scan(0, high, self.cfg.sampleRateHz, self.cfg.blockSize)
+
+            # --- E-TC connect (optional) ---
+            try:
+                from etc_device import ETCDevice
+                b = self.cfg.betc.boardNum
+                r = self.cfg.betc.sampleRateHz
+                self.etc = ETCDevice(board=b, sample_rate_hz=r, log=self.log_rx)
+                if self.etc.connect():
+                    self.log_rx(f"[INFO] E-TC connected (board={b}, {r:.1f} Hz)")
+                    self.log_rx(
+                        f"DEBUG betc: boardNum={self.cfg.betc.boardNum}, sampleRateHz={self.cfg.betc.sampleRateHz}")
+                    self.log_rx(f"DEBUG etc dict: {self.cfg.etc}")
+                else:
+                    self.log_rx("[WARN] E-TC not connected")
+            except Exception as e:
+                self.log_rx(f"[WARN] E-TC init failed: {e}")
+
             self.sample_period = 1.0 / max(1e-6, float(actual_rate))
             self._rebuild_histories_for_span()
 
@@ -863,65 +1269,94 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _render(self):
         try:
-            # Skip rendering until we’re connected and actually have samples
-            if not (self.daq and getattr(self.daq, "connected", False)):
-                return
+            # ---- Build time axis safely, even if empty ----
+            if not hasattr(self, "ai_hist_x") or self.ai_hist_x is None:
+                x_arr = np.array([], dtype=float)
+            else:
+                x_arr = np.asarray(self.ai_hist_x, dtype=float)
+            N = int(x_arr.shape[0])
 
-            # Snapshot histories as lists
-            x_list = list(self.ai_hist_x)
-            if not hasattr(self, "_x0") or self._x0 is None or (x_list and x_list[0] < self._x0): self._x0 = float(x_list[0])
-            if not x_list:
-                return
+            # ---- Slice AI history into per-channel lists (safe-blank if needed) ----
+            ys_cut = []
+            if hasattr(self, "ai_hist_y") and self.ai_hist_y:
+                for dq in self.ai_hist_y:
+                    arr = np.asarray(dq, dtype=float)
+                    if arr.shape[0] > N and N > 0:
+                        arr = arr[-N:]
+                    ys_cut.append(arr)
 
-            ai_list = [list(ch) for ch in self.ai_hist_y]  # 8
-            do_list = [list(ch) for ch in self.do_hist_y]  # 8
-            ao_list = [list(ch) for ch in getattr(self, "ao_hist_y", [[], []])]  # 2
-
-            # Window by time span
-            span = float(self.time_window_s)
-            t_end = x_list[-1]
-            t_start = t_end - span
-            i0 = bisect_left(x_list, t_start)
-            x_cut = x_list[i0:]
-            if not x_cut:
-                return
-            N = len(x_cut)
-
-            def cut_align(seq, fill=0.0):
-                out = seq[i0:]
-                if len(out) < N:
-                    out = [fill] * (N - len(out)) + out
-                elif len(out) > N:
-                    out = out[-N:]
-                return out
-
-            ys_cut = [cut_align(ch, fill=np.nan) for ch in ai_list]
-            do_cut = [cut_align(ch, fill=0.0) for ch in do_list]
-
-            ao_vals = getattr(self, "ao_value", [0.0, 0.0])
+            # AO history (if you keep it)
             ao_cut = []
-            for idx, ch in enumerate(ao_list[:2]):
-                fillv = float(ao_vals[idx]) if idx < len(ao_vals) else 0.0
-                ao_cut.append(cut_align(ch, fill=fillv))
+            if hasattr(self, "ao_hist_y") and self.ao_hist_y:
+                for dq in self.ao_hist_y:
+                    arr = np.asarray(dq, dtype=float)
+                    if arr.shape[0] > N and N > 0:
+                        arr = arr[-N:]
+                    ao_cut.append(arr)
 
-            x_arr = np.asarray(x_cut, dtype=float)
-            if x_arr.size:
-                x_arr = np.asarray(x_cut, dtype=float) - float(self._x0)
+            # DO history (bits as 0/1)
+            do_cut = []
+            if hasattr(self, "do_hist_y") and self.do_hist_y:
+                for dq in self.do_hist_y:
+                    arr = np.asarray(dq, dtype=float)
+                    if arr.shape[0] > N and N > 0:
+                        arr = arr[-N:]
+                    do_cut.append(arr)
 
-            if hasattr(self, "analog_win") and self.analog_win.isVisible():
-                self.analog_win.set_data(x_arr, ys_cut)
-            if hasattr(self, "digital_win") and self.digital_win.isVisible():
-                self.digital_win.set_data(x_arr, do_cut)
-            if hasattr(self, "combined_win") and self.combined_win.isVisible():
-                self.combined_win.set_data(x_arr, ys_cut, ao_cut, do_cut)
+            # ========== Respect "Include" flags ==========
+            # AI
+            ai_cfg = list(getattr(self.cfg, "analogs", []))
+            ai_includes = [getattr(a, "include", True) for a in ai_cfg]
+            ai_names = [getattr(a, "name", f"AI{i}") for i, a in enumerate(ai_cfg)]
+            ai_units = [getattr(a, "units", "") for a in ai_cfg]
+
+            ys_cut_inc = [ys_cut[i] for i, inc in enumerate(ai_includes) if inc and i < len(ys_cut)]
+            ai_names_inc = [ai_names[i] for i, inc in enumerate(ai_includes) if inc and i < len(ai_names)]
+            ai_units_inc = [ai_units[i] for i, inc in enumerate(ai_includes) if inc and i < len(ai_units)]
+
+            # DO
+            do_cfg = list(getattr(self.cfg, "digitalOutputs", []))
+            do_includes = [getattr(d, "include", True) for d in do_cfg]
+            do_names = [getattr(d, "name", f"DO{i}") for i, d in enumerate(do_cfg)]
+            do_cut_inc = [do_cut[i] for i, inc in enumerate(do_includes) if inc and i < len(do_cut)]
+            do_names_inc = [do_names[i] for i, inc in enumerate(do_includes) if inc and i < len(do_names)]
+
+            # TC (already built in histories)
+            tc_series = None
+            if getattr(self, "tc_hist_y", None):
+                raw_tc = [np.asarray(dq, dtype=float) for dq in self.tc_hist_y]
+                tc_series = [raw_tc[i] for i, inc in enumerate(self.tc_include) if inc]
+
+            if getattr(self, "tc_win", None) and self.tc_win.isVisible() and tc_series is not None:
+                tc_names_inc = [self.tc_titles[i] for i, inc in enumerate(self.tc_include) if inc]
+                self.tc_win.set_names_units(tc_names_inc, ["°C"] * len(tc_names_inc))
+                self.tc_win.set_data(x_arr, tc_series)
+
+
+            # ---------- Push to windows ----------
+            if getattr(self, "analog_win", None) and self.analog_win.isVisible():
+                self.analog_win.set_names_units(ai_names_inc, ai_units_inc)
+                self.analog_win.set_data(x_arr, ys_cut_inc)
+
+            if getattr(self, "digital_win", None) and self.digital_win.isVisible():
+                # set_names_units may not exist in older class; guard
+                if hasattr(self.digital_win, "set_names_units"):
+                    self.digital_win.set_names_units(do_names_inc, [""] * len(do_names_inc))
+                self.digital_win.set_data(x_arr, do_cut_inc)
+
+            if getattr(self, "tc_win", None) and self.tc_win.isVisible() and tc_series is not None:
+                tc_names_inc = [self.tc_titles[i] for i, inc in enumerate(self.tc_include) if inc]
+                self.tc_win.set_names_units(tc_names_inc, ["°C"] * len(tc_names_inc))
+                self.tc_win.set_data(x_arr, tc_series)
+
+            if getattr(self, "combined_win", None) and self.combined_win.isVisible():
+                self.combined_win.set_data(x_arr, ys_cut_inc, ao_cut, do_cut_inc, tc=tc_series)
 
         except Exception as e:
-            if self.daq and getattr(self.daq, "connected", False):
-                self.log_rx(f"Render error: {e}")
+            self.log_rx(f"Render error: {e}")
 
     def _drain_chunks(self, max_batches: int = 8):
         """Pop up to max_batches blocks from the acq queue and append to histories.
-
         X is a relative time axis that starts at 0.0 for the first sample and
         advances by the current sample period (self.sample_period).
         """
@@ -945,11 +1380,24 @@ class MainWindow(QtWidgets.QMainWindow):
                 arr = arr.reshape(1, -1)
             num_ch, M = int(arr.shape[0]), int(arr.shape[1])
 
+            # --- Read a thermocouple block (hold values across M samples) ---
+            tc_block_2d = None
+            try:
+                if self.etc and self.etc.connected and self.tc_enabled:
+                    # Select only included TC channels for charts; PIDs can still use any TC index by config order
+                    # Build ordered channel/type lists for the E-TC read
+                    enabled_chs = self.tc_enabled
+                    tc_types = self.tc_types
+                    tc_block_2d, _nchtc = self.etc.read_block(enabled_chs, tc_types, M, sp)  # (M, n_tc)
+            except Exception as e:
+                self.log_rx(f"[E-TC] read error: {e}")
+                tc_block_2d = None
+
             # --- PID: run loops on this block and apply outputs ---
             try:
                 # ai_block_2d shape must be (nsamples, nch)
                 ai_block_2d = arr.T  # we currently have (nch, M) -> transpose
-                do_updates, ao_updates = self.pid_mgr.process_block(ai_block_2d, float(sp))
+                do_updates, ao_updates = self.pid_mgr.process_block(arr.T, float(sp), tc_block_2d=tc_block_2d)
 
                 # Apply DO updates ONLY if that channel is currently controlled by an enabled loop
                 for ch, bit in do_updates.items():
@@ -976,6 +1424,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
             # Append to histories
             self.ai_hist_x.extend(x_block.tolist())
+
+            # --- Read a TC block (hold last values across this AI block) ---
+            tc_block_2d = None
+            try:
+                if self.etc and getattr(self.etc, "connected", False) and self.tc_enabled:
+                    enabled_chs = self.tc_enabled
+                    tc_types = self.tc_types
+                    tc_block_2d, _nchtc = self.etc.read_block(enabled_chs, tc_types, M, sp)  # (M, n_tc)
+            except Exception as e:
+                self.log_rx(f"[E-TC] read error: {e}")
+                tc_block_2d = None
+
+            # --- Extend TC histories ---
+            if tc_block_2d is not None:
+                n_tc = tc_block_2d.shape[1]
+                for i in range(n_tc):
+                    self.tc_hist_y[i].extend(tc_block_2d[:, i].tolist())
 
             # AI channels; if fewer channels scanned, pad remaining with NaNs
             for ch in range(8):
@@ -1026,23 +1491,80 @@ class MainWindow(QtWidgets.QMainWindow):
         self.script.reset()
         self.log_rx("Script: RESET")
 
+    def _open_tc_window(self):
+        if not hasattr(self, "tc_win") or self.tc_win is None:
+            names = getattr(self, "tc_titles", [])
+            units = ["°C"] * len(names)
+            self.tc_win = AnalogChartWindow(names, units)
+            self.tc_win.setWindowTitle("Thermocouples (°C)")
+            self.tc_win.spanChanged.connect(self._on_span_changed)
+            self.tc_win.set_span(self.time_window_s)
+        else:
+            self.tc_win.set_names_units(self.tc_titles, ["°C"] * len(self.tc_titles))
+        self.tc_win.show();
+        self.tc_win.raise_()
+
     def _act_pid_setup(self):
-        dlg = PIDSetupDialog(self, existing=self.pid_mgr.loops)
-        if _dlg_exec(dlg) == DLG_ACCEPTED:
-            vals = dlg.values()
-            if len(vals) > 8:
-                QtWidgets.QMessageBox.warning(self, "PID", "Max 8 PID loops.")
-                vals = vals[:8]
-            self.pid_mgr.loops = [PIDLoopDef(**v) for v in vals]
+        # if a path was chosen earlier but not yet loaded, ensure it’s loaded
+        try:
+            if getattr(self, "pid_path", None) and not getattr(self.pid_mgr, "loops", []):
+                self.pid_mgr.load_file(self.pid_path)
+        except Exception:
+            pass
+        dlg = PIDSetupDialog(self.pid_mgr, self)
+
+        # Make a snapshot to detect changes
+        try:
+            before = [vars(type("X", (object,), {})())]  # dummy to force except
+        except Exception:
+            before = None
+        # Safer snapshot:
+        try:
+            import copy
+            before = copy.deepcopy([vars(lp).copy() for lp in self.pid_mgr.loops])
+        except Exception:
+            before = None
+
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            # Rebuild running instances and reset states
             self.pid_mgr._rebuild_instances()
             self.pid_mgr.reset_states()
-            try:
-                self.pid_mgr.save_file("PID.json")
-                self.log_rx("[INFO] Saved PID.json")
-            except Exception as e:
-                self.log_rx(f"[WARN] PID.json save failed: {e}")
             self._pid_refresh_table_structure()
             self._pid_update_table_values()
+
+            # Detect changes
+            changed = True
+            try:
+                import copy
+                after = copy.deepcopy([vars(lp).copy() for lp in self.pid_mgr.loops])
+                changed = (before is None) or (after != before)
+            except Exception:
+                changed = True
+
+            if changed:
+                mb = QtWidgets.QMessageBox(self)
+                mb.setWindowTitle("Save PID changes?")
+                mb.setText("PID settings have changed. Do you want to save them?")
+                mb.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Save |
+                                      QtWidgets.QMessageBox.StandardButton.Discard |
+                                      QtWidgets.QMessageBox.StandardButton.Cancel)
+                mb.setDefaultButton(QtWidgets.QMessageBox.StandardButton.Save)
+                res = mb.exec()
+                if res == QtWidgets.QMessageBox.StandardButton.Save:
+                    # save to last known pid_path or ask
+                    path = getattr(self, "pid_path", None)
+                    if not path:
+                        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save PID As...", "PID.json",
+                                                                        "JSON (*.json)")
+                    if path:
+                        try:
+                            self.pid_mgr.save_file(path)
+                            self.pid_path = path
+                            self.log_rx(f"[INFO] PID saved to {path}")
+                        except Exception as e:
+                            QtWidgets.QMessageBox.critical(self, "PID save error", str(e))
+                elif res == QtWidgets.QMessageBox.StandardButton.Cancel:
+                    return
 
     def _pid_refresh_table_structure(self):
         loops = getattr(self.pid_mgr, "loops", [])
@@ -1249,4 +1771,24 @@ MainWindow._pid_on_gain_changed = _pid_on_gain_changed
 
 def main():
     app=QtWidgets.QApplication(sys.argv); w=MainWindow(); w.show(); return app.exec()
-if __name__=="__main__": raise SystemExit(main())
+if __name__ == "__main__":
+    import sys
+    from PyQt6 import QtWidgets, QtCore
+    app = QtWidgets.QApplication(sys.argv)
+    w = MainWindow()
+    w.show()
+
+    # Only auto-open via a timer so the main window exists as the parent
+    # Toggle any you want to auto-open:
+    AUTO_OPEN_CONFIG = False
+    AUTO_OPEN_SCRIPT = False
+    AUTO_OPEN_PID    = False
+
+    if AUTO_OPEN_CONFIG:
+        QtCore.QTimer.singleShot(0, w._act_edit_cfg)
+    if AUTO_OPEN_SCRIPT:
+        QtCore.QTimer.singleShot(0, w._act_edit_script)
+    if AUTO_OPEN_PID:
+        QtCore.QTimer.singleShot(0, w._act_pid_setup)
+
+    sys.exit(app.exec())

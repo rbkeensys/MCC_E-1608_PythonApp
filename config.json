@@ -1,114 +1,137 @@
 {
-  "boardNum": 0,
-  "sampleRateHz": 100.0,
-  "blockSize": 128,
-  "aiMode": "SE",
+  "board1608": {
+    "boardNum": 0,
+    "sampleRateHz": 100.0,
+    "blockSize": 128,
+    "aiMode": "SE"
+  },
+  "boardetc": {
+    "boardNum": 1,
+    "sampleRateHz": 100.0,
+    "blockSize": 128
+  },
   "analogs": [
     {
       "name": "Voltage",
       "slope": 1.0,
       "offset": 0.0,
       "cutoffHz": 1.0,
-      "units": ""
+      "units": "",
+      "include": true
     },
     {
       "name": "Out Temp",
       "slope": 22.0,
       "offset": 32.0,
       "cutoffHz": 0.005,
-      "units": ""
+      "units": "",
+      "include": true
     },
     {
       "name": "In Temp",
       "slope": 22.0,
       "offset": 32.0,
       "cutoffHz": 0.1,
-      "units": ""
+      "units": "",
+      "include": true
     },
     {
       "name": "Pressure",
       "slope": 5.0,
       "offset": -25.0,
       "cutoffHz": 5.0,
-      "units": ""
+      "units": "",
+      "include": false
     },
     {
       "name": "Spare 0",
       "slope": 1.0,
       "offset": 0.0,
       "cutoffHz": 0.1,
-      "units": ""
+      "units": "",
+      "include": false
     },
     {
       "name": "Spare 1",
       "slope": 1.0,
       "offset": 0.0,
       "cutoffHz": 1.0,
-      "units": ""
+      "units": "",
+      "include": false
     },
     {
       "name": "Spare 2",
       "slope": 1.0,
       "offset": 0.0,
       "cutoffHz": 2.0,
-      "units": ""
+      "units": "",
+      "include": false
     },
     {
       "name": "Spare 3",
       "slope": 1.0,
       "offset": 0.0,
       "cutoffHz": 5.0,
-      "units": ""
+      "units": "",
+      "include": false
     }
   ],
   "digitalOutputs": [
     {
-      "name": "Relay1",
+      "name": "Heater1",
       "normallyOpen": false,
       "momentary": false,
-      "actuationTime": 0.0
+      "actuationTime": 0.0,
+      "include": true
     },
     {
       "name": "Valve N2",
-      "normallyOpen": true,
+      "normallyOpen": false,
       "momentary": false,
-      "actuationTime": 0.0
+      "actuationTime": 0.0,
+      "include": true
     },
     {
-      "name": "DO",
-      "normallyOpen": true,
+      "name": "D2",
+      "normallyOpen": false,
       "momentary": false,
-      "actuationTime": 0.0
+      "actuationTime": 0.0,
+      "include": false
     },
     {
-      "name": "DO",
-      "normallyOpen": true,
+      "name": "D3",
+      "normallyOpen": false,
       "momentary": false,
-      "actuationTime": 0.0
+      "actuationTime": 0.0,
+      "include": false
     },
     {
-      "name": "DO",
-      "normallyOpen": true,
+      "name": "D4",
+      "normallyOpen": false,
       "momentary": false,
-      "actuationTime": 0.0
+      "actuationTime": 0.0,
+      "include": false
     },
     {
-      "name": "DO",
-      "normallyOpen": true,
+      "name": "D5",
+      "normallyOpen": false,
       "momentary": false,
-      "actuationTime": 0.0
+      "actuationTime": 0.0,
+      "include": false
     },
     {
-      "name": "DO",
-      "normallyOpen": true,
+      "name": "D6",
+      "normallyOpen": false,
       "momentary": false,
-      "actuationTime": 0.0
+      "actuationTime": 0.0,
+      "include": false
     },
     {
-      "name": "DO",
-      "normallyOpen": true,
+      "name": "D7",
+      "normallyOpen": false,
       "momentary": false,
-      "actuationTime": 0.0
+      "actuationTime": 0.0,
+      "include": false
     }
   ],
   "analogOutputs": [
@@ -116,13 +139,29 @@
       "name": "AO0",
       "minV": 1.0,
       "maxV": 10.0,
-      "startupV": 0.0
+      "startupV": 0.0,
+      "include": true
     },
     {
       "name": "AO1",
       "minV": 0.0,
       "maxV": 10.0,
-      "startupV": 0.0
+      "startupV": 0.0,
+      "include": false
+    }
+  ],
+  "thermocouples": [
+    {
+      "ch": 0,
+      "name": "Bot Temp",
+      "type": "T",
+      "include": true
+    },
+    {
+      "ch": 1,
+      "name": "Temp",
+      "type": "T",
+      "include": true
     }
   ]
 }

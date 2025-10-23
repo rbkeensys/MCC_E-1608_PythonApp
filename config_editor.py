@@ -1,83 +1,427 @@
+# config_editor.py
+from __future__ import annotations
+from typing import List
 from PyQt6 import QtCore, QtWidgets
 from config_manager import AppConfig, AnalogCfg, DigitalOutCfg, AnalogOutCfg
 
+
+MAX_AI = 8    # E-1608
+MAX_DO = 8    # E-1608
+MAX_AO = 2    # E-1608
+MAX_TC = 32   # E-TC family (safe upper bound)
+
+
 class ConfigEditorDialog(QtWidgets.QDialog):
-    def __init__(self, parent, cfg: AppConfig):
+    """
+    Full editor with:
+      - General (E-1608 + E-TC)
+      - Analog Inputs (Add/Remove, Include)
+      - Digital Outputs (Add/Remove, Include)
+      - Analog Outputs (Include)
+      - Thermocouples (Add/Remove, Include, Type)
+    Safe with both flat AppConfig (boardNum, ...) and nested (b1608/betc).
+    """
+    def __init__(self, cfg: AppConfig, parent: QtWidgets.QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle("Edit Config")
+        self.resize(980, 680)
         self._cfg = cfg
-        self.resize(900, 600)
-        layout = QtWidgets.QVBoxLayout(self)
 
-        tabs = QtWidgets.QTabWidget(); layout.addWidget(tabs)
+        v = QtWidgets.QVBoxLayout(self)
+        self.tabs = QtWidgets.QTabWidget()
+        v.addWidget(self.tabs)
 
-        gen = QtWidgets.QWidget(); gform = QtWidgets.QFormLayout(gen)
-        self.sp_board = QtWidgets.QSpinBox(); self.sp_board.setRange(0, 31); self.sp_board.setValue(cfg.boardNum)
-        self.sp_rate = QtWidgets.QDoubleSpinBox(); self.sp_rate.setRange(0.1, 200000.0); self.sp_rate.setDecimals(3); self.sp_rate.setValue(cfg.sampleRateHz)
-        self.sp_block = QtWidgets.QSpinBox(); self.sp_block.setRange(1, 65536); self.sp_block.setValue(cfg.blockSize)
-        self.cmb_mode = QtWidgets.QComboBox(); self.cmb_mode.addItems(["SE (8 channels)", "DIFF (4 channels)"]); self.cmb_mode.setCurrentIndex(0 if cfg.aiMode.upper().startswith("SE") else 1)
-        gform.addRow("Board #", self.sp_board); gform.addRow("Sample Rate (Hz)", self.sp_rate); gform.addRow("Block Size", self.sp_block); gform.addRow("Analog Input Mode", self.cmb_mode)
-        tabs.addTab(gen, "General")
+        # ----- Tabs -----
+        self._build_tab_general(cfg)
+        self._build_tab_ai(cfg)
+        self._build_tab_do(cfg)
+        self._build_tab_ao(cfg)
+        self._build_tab_tc(cfg)
 
-        aiw = QtWidgets.QWidget(); vbox = QtWidgets.QVBoxLayout(aiw)
-        self.tbl_ai = QtWidgets.QTableWidget(8, 5); self.tbl_ai.setHorizontalHeaderLabels(["Name","Slope","Offset","Cutoff Hz","Units"])
+        # ----- Buttons -----
+        btns = QtWidgets.QHBoxLayout()
+        btns.addStretch(1)
+        self.btn_ok = QtWidgets.QPushButton("OK")
+        self.btn_cancel = QtWidgets.QPushButton("Cancel")
+        btns.addWidget(self.btn_ok); btns.addWidget(self.btn_cancel)
+        v.addLayout(btns)
+
+        self.btn_ok.clicked.connect(self.accept)
+        self.btn_cancel.clicked.connect(self.reject)
+
+    # ===================== General =====================
+    def _build_tab_general(self, cfg: AppConfig):
+        w = QtWidgets.QWidget(); form = QtWidgets.QFormLayout(w)
+
+        # Prefer nested b1608, fall back to flat
+        b1608 = getattr(cfg, "b1608", None)
+        betc  = getattr(cfg, "betc",  None)
+
+        # E-1608
+        board1608 = getattr(b1608, "boardNum", getattr(cfg, "boardNum", 0))
+        rate1608  = getattr(b1608, "sampleRateHz", getattr(cfg, "sampleRateHz", 100.0))
+        block1608 = getattr(b1608, "blockSize", getattr(cfg, "blockSize", 128))
+        mode1608  = getattr(b1608, "aiMode", getattr(cfg, "aiMode", "SE"))
+
+        self.sp_1608_board = QtWidgets.QSpinBox(); self.sp_1608_board.setRange(0, 31); self.sp_1608_board.setValue(int(board1608))
+        self.dbl_1608_rate = QtWidgets.QDoubleSpinBox(); self.dbl_1608_rate.setDecimals(3); self.dbl_1608_rate.setRange(0.1, 1_000_000.0); self.dbl_1608_rate.setValue(float(rate1608))
+        self.sp_1608_block = QtWidgets.QSpinBox(); self.sp_1608_block.setRange(1, 1_000_000); self.sp_1608_block.setValue(int(block1608))
+        self.cmb_1608_mode = QtWidgets.QComboBox(); self.cmb_1608_mode.addItems(["SE","DIFF"])
+        try:
+            self.cmb_1608_mode.setCurrentText(str(mode1608).upper())
+        except Exception:
+            self.cmb_1608_mode.setCurrentIndex(0)
+
+        form.addRow(QtWidgets.QLabel("<b>E-1608</b>"))
+        form.addRow("Board #", self.sp_1608_board)
+        form.addRow("Sample rate (Hz)", self.dbl_1608_rate)
+        form.addRow("Block size", self.sp_1608_block)
+        form.addRow("AI mode", self.cmb_1608_mode)
+
+        # E-TC
+        etc_board = getattr(betc, "boardNum", 0)
+        etc_rate  = getattr(betc, "sampleRateHz", 10.0)
+        etc_block = getattr(betc, "blockSize", 128)
+
+        self.sp_etc_board = QtWidgets.QSpinBox(); self.sp_etc_board.setRange(0, 31); self.sp_etc_board.setValue(int(etc_board))
+        self.dbl_etc_rate = QtWidgets.QDoubleSpinBox(); self.dbl_etc_rate.setDecimals(3); self.dbl_etc_rate.setRange(0.1, 100_000.0); self.dbl_etc_rate.setValue(float(etc_rate))
+        self.sp_etc_block = QtWidgets.QSpinBox(); self.sp_etc_block.setRange(1, 1_000_000); self.sp_etc_block.setValue(int(etc_block))
+
+        form.addRow(QtWidgets.QLabel(""))
+        form.addRow(QtWidgets.QLabel("<b>E-TC</b>"))
+        form.addRow("Board #", self.sp_etc_board)
+        form.addRow("Sample rate (Hz)", self.dbl_etc_rate)
+        form.addRow("Block size", self.sp_etc_block)
+
+        self.tabs.addTab(w, "General")
+
+    # ===================== Analog Inputs =====================
+    def _build_tab_ai(self, cfg: AppConfig):
+        w = QtWidgets.QWidget(); v = QtWidgets.QVBoxLayout(w)
+        self.tbl_ai = QtWidgets.QTableWidget()
+        self.tbl_ai.setColumnCount(7)
+        self.tbl_ai.setHorizontalHeaderLabels(["Channel","Name","Slope","Offset","Cutoff Hz","Units","Include"])
         self.tbl_ai.horizontalHeader().setStretchLastSection(True)
-        for i, a in enumerate(cfg.analogs):
-            self.tbl_ai.setItem(i, 0, QtWidgets.QTableWidgetItem(a.name))
-            for col, val in enumerate([a.slope, a.offset, a.cutoffHz], start=1):
-                item = QtWidgets.QTableWidgetItem(str(val)); item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-                self.tbl_ai.setItem(i, col, item)
-            self.tbl_ai.setItem(i, 4, QtWidgets.QTableWidgetItem(a.units or ""))
-        vbox.addWidget(self.tbl_ai); tabs.addTab(aiw, "Analog Inputs")
+        v.addWidget(self.tbl_ai)
 
-        dow = QtWidgets.QWidget(); vbox2 = QtWidgets.QVBoxLayout(dow)
-        self.tbl_do = QtWidgets.QTableWidget(8, 4); self.tbl_do.setHorizontalHeaderLabels(["Name","Normally Open","Momentary","Actuation Time (s)"])
+        # Buttons
+        hb = QtWidgets.QHBoxLayout(); hb.addStretch(1)
+        self.btn_ai_add = QtWidgets.QPushButton("Add")
+        self.btn_ai_remove = QtWidgets.QPushButton("Remove")
+        hb.addWidget(self.btn_ai_add); hb.addWidget(self.btn_ai_remove)
+        v.addLayout(hb)
+
+        # Fill table
+        rows = max(len(getattr(cfg, "analogs", [])), 1)
+        self.tbl_ai.setRowCount(min(rows, MAX_AI))
+        for r in range(min(rows, MAX_AI)):
+            a = cfg.analogs[r]
+            self._ai_set_row(r, r, a)
+
+        # Signals
+        self.btn_ai_add.clicked.connect(self._ai_on_add)
+        self.btn_ai_remove.clicked.connect(self._ai_on_remove)
+
+        self.tabs.addTab(w, "Analog Inputs")
+
+    def _ai_set_row(self, row: int, ch: int, a: AnalogCfg):
+        sp = QtWidgets.QSpinBox(); sp.setRange(0, MAX_AI - 1); sp.setValue(int(ch))
+        self.tbl_ai.setCellWidget(row, 0, sp)
+
+        self.tbl_ai.setItem(row, 1, QtWidgets.QTableWidgetItem(a.name))
+        self.tbl_ai.setItem(row, 2, self._num_item(a.slope))
+        self.tbl_ai.setItem(row, 3, self._num_item(a.offset))
+        self.tbl_ai.setItem(row, 4, self._num_item(a.cutoffHz))
+        self.tbl_ai.setItem(row, 5, QtWidgets.QTableWidgetItem(getattr(a, "units", "") or ""))
+
+        inc = QtWidgets.QTableWidgetItem()
+        inc.setFlags(inc.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+        inc.setCheckState(QtCore.Qt.CheckState.Checked if getattr(a, "include", True) else QtCore.Qt.CheckState.Unchecked)
+        self.tbl_ai.setItem(row, 6, inc)
+
+    def _ai_on_add(self):
+        r = self.tbl_ai.rowCount()
+        if r >= MAX_AI:
+            return
+        self.tbl_ai.insertRow(r)
+        self._ai_set_row(r, r, AnalogCfg(name=f"AI{r}"))
+
+    def _ai_on_remove(self):
+        r = self.tbl_ai.currentRow()
+        if r >= 0 and self.tbl_ai.rowCount() > 0:
+            self.tbl_ai.removeRow(r)
+
+    # ===================== Digital Outputs =====================
+    def _build_tab_do(self, cfg: AppConfig):
+        w = QtWidgets.QWidget(); v = QtWidgets.QVBoxLayout(w)
+        self.tbl_do = QtWidgets.QTableWidget()
+        self.tbl_do.setColumnCount(5)
+        self.tbl_do.setHorizontalHeaderLabels(["Channel","Name","Normally Open","Momentary (ms)","Include"])
         self.tbl_do.horizontalHeader().setStretchLastSection(True)
-        for i, d in enumerate(cfg.digitalOutputs):
-            self.tbl_do.setItem(i, 0, QtWidgets.QTableWidgetItem(d.name))
-            chk_no = QtWidgets.QTableWidgetItem(); chk_no.setFlags(chk_no.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable); chk_no.setCheckState(QtCore.Qt.CheckState.Checked if d.normallyOpen else QtCore.Qt.CheckState.Unchecked)
-            chk_mo = QtWidgets.QTableWidgetItem(); chk_mo.setFlags(chk_mo.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable); chk_mo.setCheckState(QtCore.Qt.CheckState.Checked if d.momentary else QtCore.Qt.CheckState.Unchecked)
-            self.tbl_do.setItem(i, 1, chk_no); self.tbl_do.setItem(i, 2, chk_mo)
-            item_time = QtWidgets.QTableWidgetItem(str(d.actuationTime)); item_time.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-            self.tbl_do.setItem(i, 3, item_time)
-        vbox2.addWidget(self.tbl_do); tabs.addTab(dow, "Digital Outputs")
+        v.addWidget(self.tbl_do)
 
-        aow = QtWidgets.QWidget(); vbox3 = QtWidgets.QVBoxLayout(aow)
-        self.tbl_ao = QtWidgets.QTableWidget(2, 4); self.tbl_ao.setHorizontalHeaderLabels(["Name","Min V","Max V","Startup V"])
+        hb = QtWidgets.QHBoxLayout(); hb.addStretch(1)
+        self.btn_do_add = QtWidgets.QPushButton("Add")
+        self.btn_do_remove = QtWidgets.QPushButton("Remove")
+        hb.addWidget(self.btn_do_add); hb.addWidget(self.btn_do_remove)
+        v.addLayout(hb)
+
+        rows = max(len(getattr(cfg, "digitalOutputs", [])), 1)
+        self.tbl_do.setRowCount(min(rows, MAX_DO))
+        for r in range(min(rows, MAX_DO)):
+            d = cfg.digitalOutputs[r]
+            self._do_set_row(r, r, d)
+
+        self.btn_do_add.clicked.connect(self._do_on_add)
+        self.btn_do_remove.clicked.connect(self._do_on_remove)
+
+        self.tabs.addTab(w, "Digital Outputs")
+
+    def _do_set_row(self, row: int, ch: int, d: DigitalOutCfg):
+        sp = QtWidgets.QSpinBox(); sp.setRange(0, MAX_DO - 1); sp.setValue(int(ch))
+        self.tbl_do.setCellWidget(row, 0, sp)
+
+        self.tbl_do.setItem(row, 1, QtWidgets.QTableWidgetItem(d.name))
+
+        cb_no = QtWidgets.QTableWidgetItem()
+        cb_no.setFlags(cb_no.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+        cb_no.setCheckState(QtCore.Qt.CheckState.Checked if d.normallyOpen else QtCore.Qt.CheckState.Unchecked)
+        self.tbl_do.setItem(row, 2, cb_no)
+
+        # store milliseconds in a normal item (number-as-text)
+        self.tbl_do.setItem(row, 3, self._num_item(getattr(d, "actuationTime", 0.0)))
+
+        inc = QtWidgets.QTableWidgetItem()
+        inc.setFlags(inc.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+        inc.setCheckState(QtCore.Qt.CheckState.Checked if getattr(d, "include", True) else QtCore.Qt.CheckState.Unchecked)
+        self.tbl_do.setItem(row, 4, inc)
+
+    def _do_on_add(self):
+        r = self.tbl_do.rowCount()
+        if r >= MAX_DO:
+            return
+        self.tbl_do.insertRow(r)
+        self._do_set_row(r, r, DigitalOutCfg(name=f"DO{r}"))
+
+    def _do_on_remove(self):
+        r = self.tbl_do.currentRow()
+        if r >= 0 and self.tbl_do.rowCount() > 0:
+            self.tbl_do.removeRow(r)
+
+    # ===================== Analog Outputs =====================
+    def _build_tab_ao(self, cfg: AppConfig):
+        w = QtWidgets.QWidget(); v = QtWidgets.QVBoxLayout(w)
+        self.tbl_ao = QtWidgets.QTableWidget()
+        self.tbl_ao.setColumnCount(6)
+        self.tbl_ao.setHorizontalHeaderLabels(["Channel","Name","Min V","Max V","Startup V","Include"])
         self.tbl_ao.horizontalHeader().setStretchLastSection(True)
-        for i, a in enumerate(cfg.analogOutputs):
-            self.tbl_ao.setItem(i, 0, QtWidgets.QTableWidgetItem(a.name))
-            for col, val in enumerate([a.minV, a.maxV, a.startupV], start=1):
-                item = QtWidgets.QTableWidgetItem(str(val)); item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-                self.tbl_ao.setItem(i, col, item)
-        vbox3.addWidget(self.tbl_ao); tabs.addTab(aow, "Analog Outputs")
+        v.addWidget(self.tbl_ao)
 
-        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
-        btns.accepted.connect(self.accept); btns.rejected.connect(self.reject); layout.addWidget(btns)
+        rows = max(len(getattr(cfg, "analogOutputs", [])), MAX_AO)
+        self.tbl_ao.setRowCount(min(rows, MAX_AO))
+        for r in range(min(rows, MAX_AO)):
+            a = cfg.analogOutputs[r]
+            self._ao_set_row(r, r, a)
 
-    def updated_config(self) -> AppConfig:
-        cfg = AppConfig()
-        cfg.boardNum = int(self.sp_board.value())
-        cfg.sampleRateHz = float(self.sp_rate.value())
-        cfg.blockSize = int(self.sp_block.value())
-        cfg.aiMode = "SE" if self.cmb_mode.currentIndex() == 0 else "DIFF"
-        for i in range(8):
-            name = self.tbl_ai.item(i, 0).text() if self.tbl_ai.item(i, 0) else f"AI{i}"
-            slope = float(self.tbl_ai.item(i, 1).text()) if self.tbl_ai.item(i, 1) else 1.0
-            offset = float(self.tbl_ai.item(i, 2).text()) if self.tbl_ai.item(i, 2) else 0.0
-            cutoff = float(self.tbl_ai.item(i, 3).text()) if self.tbl_ai.item(i, 3) else 0.0
-            units = self.tbl_ai.item(i, 4).text() if self.tbl_ai.item(i, 4) else ""
-            cfg.analogs[i] = AnalogCfg(name=name, slope=slope, offset=offset, cutoffHz=cutoff, units=units)
-        for i in range(8):
-            name = self.tbl_do.item(i, 0).text() if self.tbl_do.item(i, 0) else f"DO{i}"
-            no = self.tbl_do.item(i, 1).checkState() == QtCore.Qt.CheckState.Checked
-            mo = self.tbl_do.item(i, 2).checkState() == QtCore.Qt.CheckState.Checked
-            t = float(self.tbl_do.item(i, 3).text()) if self.tbl_do.item(i, 3) else 0.0
-            cfg.digitalOutputs[i] = DigitalOutCfg(name=name, normallyOpen=no, momentary=mo, actuationTime=t)
-        for i in range(2):
-            name = self.tbl_ao.item(i, 0).text() if self.tbl_ao.item(i, 0) else f"AO{i}"
-            minv = float(self.tbl_ao.item(i, 1).text()) if self.tbl_ao.item(i, 1) else -10.0
-            maxv = float(self.tbl_ao.item(i, 2).text()) if self.tbl_ao.item(i, 2) else 10.0
-            st = float(self.tbl_ao.item(i, 3).text()) if self.tbl_ao.item(i, 3) else 0.0
-            cfg.analogOutputs[i] = AnalogOutCfg(name=name, minV=minv, maxV=maxv, startupV=st)
+        self.tabs.addTab(w, "Analog Outputs")
+
+    def _ao_set_row(self, row: int, ch: int, a: AnalogOutCfg):
+        sp = QtWidgets.QSpinBox(); sp.setRange(0, MAX_AO - 1); sp.setValue(int(ch))
+        self.tbl_ao.setCellWidget(row, 0, sp)
+
+        self.tbl_ao.setItem(row, 1, QtWidgets.QTableWidgetItem(a.name))
+        self.tbl_ao.setItem(row, 2, self._num_item(a.minV))
+        self.tbl_ao.setItem(row, 3, self._num_item(a.maxV))
+        self.tbl_ao.setItem(row, 4, self._num_item(a.startupV))
+
+        inc = QtWidgets.QTableWidgetItem()
+        inc.setFlags(inc.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+        inc.setCheckState(QtCore.Qt.CheckState.Checked if getattr(a, "include", True) else QtCore.Qt.CheckState.Unchecked)
+        self.tbl_ao.setItem(row, 5, inc)
+
+    # ===================== Thermocouples (E-TC) =====================
+    def _build_tab_tc(self, cfg: AppConfig):
+        w = QtWidgets.QWidget(); v = QtWidgets.QVBoxLayout(w)
+        self.tbl_tc = QtWidgets.QTableWidget()
+        self.tbl_tc.setColumnCount(4)
+        self.tbl_tc.setHorizontalHeaderLabels(["Channel","Name","Type","Include"])
+        self.tbl_tc.horizontalHeader().setStretchLastSection(True)
+        v.addWidget(self.tbl_tc)
+
+        hb = QtWidgets.QHBoxLayout(); hb.addStretch(1)
+        self.btn_tc_add = QtWidgets.QPushButton("Add")
+        self.btn_tc_remove = QtWidgets.QPushButton("Remove")
+        hb.addWidget(self.btn_tc_add); hb.addWidget(self.btn_tc_remove)
+        v.addLayout(hb)
+
+        tc_list = list(getattr(cfg, "thermocouples", []))
+        rows = max(len(tc_list), 0)
+        self.tbl_tc.setRowCount(min(rows if rows else 0, MAX_TC))
+        # if no entries, start empty (user can Add)
+        for r in range(min(rows, MAX_TC)):
+            d = tc_list[r] or {}
+            self._tc_set_row(r,
+                             ch=int(d.get("ch", r)),
+                             name=str(d.get("name", f"TC{r}")),
+                             typ=str(d.get("type", "K")).upper(),
+                             include=bool(d.get("include", True)))
+
+        self.btn_tc_add.clicked.connect(self._tc_on_add)
+        self.btn_tc_remove.clicked.connect(self._tc_on_remove)
+
+        self.tabs.addTab(w, "Thermocouples (E-TC)")
+
+    def _tc_set_row(self, row: int, ch: int, name: str, typ: str, include: bool):
+        sp = QtWidgets.QSpinBox(); sp.setRange(0, MAX_TC - 1); sp.setValue(int(ch))
+        self.tbl_tc.setCellWidget(row, 0, sp)
+
+        self.tbl_tc.setItem(row, 1, QtWidgets.QTableWidgetItem(name))
+        cb = QtWidgets.QComboBox(); cb.addItems(["J","K","T","E","N","B","R","S"])
+        if typ.upper() not in ["J","K","T","E","N","B","R","S"]:
+            typ = "K"
+        cb.setCurrentText(typ.upper())
+        self.tbl_tc.setCellWidget(row, 2, cb)
+
+        inc = QtWidgets.QTableWidgetItem()
+        inc.setFlags(inc.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+        inc.setCheckState(QtCore.Qt.CheckState.Checked if include else QtCore.Qt.CheckState.Unchecked)
+        self.tbl_tc.setItem(row, 3, inc)
+
+    def _tc_on_add(self):
+        r = self.tbl_tc.rowCount()
+        if r >= MAX_TC:
+            return
+        self.tbl_tc.insertRow(r)
+        self._tc_set_row(r, ch=r, name=f"TC{r}", typ="K", include=True)
+
+    def _tc_on_remove(self):
+        r = self.tbl_tc.currentRow()
+        if r >= 0 and self.tbl_tc.rowCount() > 0:
+            self.tbl_tc.removeRow(r)
+
+    # ===================== Helpers =====================
+    @staticmethod
+    def _num_item(val: float) -> QtWidgets.QTableWidgetItem:
+        it = QtWidgets.QTableWidgetItem(f"{float(val):.6g}")
+        it.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        return it
+
+    # ===================== Save =====================
+    def result_config(self) -> AppConfig:
+        """
+        Build a new AppConfig from the UI state (non-destructive copy of unknown fields).
+        Works with both nested (b1608/betc) and flat AppConfig shapes.
+        """
+        cfg = self._cfg  # edit in-place to preserve any extra fields the app might rely on
+
+        # ---- Boards (E-1608) ----
+        if hasattr(cfg, "b1608"):
+            cfg.b1608.boardNum = int(self.sp_1608_board.value())
+            cfg.b1608.sampleRateHz = float(self.dbl_1608_rate.value())
+            cfg.b1608.blockSize = int(self.sp_1608_block.value())
+            cfg.b1608.aiMode = self.cmb_1608_mode.currentText().upper()
+        else:
+            cfg.boardNum = int(self.sp_1608_board.value())
+            cfg.sampleRateHz = float(self.dbl_1608_rate.value())
+            cfg.blockSize = int(self.sp_1608_block.value())
+            cfg.aiMode = self.cmb_1608_mode.currentText().upper()
+
+        # ---- Boards (E-TC) ----
+        if hasattr(cfg, "betc"):
+            cfg.betc.boardNum = int(self.sp_etc_board.value())
+            cfg.betc.sampleRateHz = float(self.dbl_etc_rate.value())
+            cfg.betc.blockSize = int(self.sp_etc_block.value())
+        elif hasattr(cfg, "etc"):
+            # dict-like property (back-compat)
+            cfg.etc = {
+                "board": int(self.sp_etc_board.value()),
+                "sample_rate_hz": float(self.dbl_etc_rate.value()),
+                "block_size": int(self.sp_etc_block.value()),
+            }
+
+        # ---- Analog Inputs ----
+        ai_rows = min(self.tbl_ai.rowCount(), MAX_AI)
+        new_analogs: List[AnalogCfg] = []
+        for r in range(ai_rows):
+            ch = self.tbl_ai.cellWidget(r, 0).value() if self.tbl_ai.cellWidget(r, 0) else r
+            name = self._safe_text(self.tbl_ai.item(r, 1), f"AI{ch}")
+            slope = self._safe_float(self.tbl_ai.item(r, 2), 1.0)
+            offset = self._safe_float(self.tbl_ai.item(r, 3), 0.0)
+            cutoff = self._safe_float(self.tbl_ai.item(r, 4), 0.0)
+            units = self._safe_text(self.tbl_ai.item(r, 5), "")
+            inc_it = self.tbl_ai.item(r, 6)
+            include = (inc_it.checkState() == QtCore.Qt.CheckState.Checked) if inc_it else True
+            a = AnalogCfg(name=name, slope=slope, offset=offset, cutoffHz=cutoff, units=units)
+            # include may not exist in older AnalogCfg; attach dynamically
+            setattr(a, "include", bool(include))
+            new_analogs.append(a)
+        # Pad to MAX_AI if existing cfg expects 8
+        while len(new_analogs) < MAX_AI:
+            a = AnalogCfg(name=f"AI{len(new_analogs)}")
+            setattr(a, "include", True)
+            new_analogs.append(a)
+        cfg.analogs = new_analogs[:MAX_AI]
+
+        # ---- Digital Outputs ----
+        do_rows = min(self.tbl_do.rowCount(), MAX_DO)
+        new_dos: List[DigitalOutCfg] = []
+        for r in range(do_rows):
+            ch = self.tbl_do.cellWidget(r, 0).value() if self.tbl_do.cellWidget(r, 0) else r
+            name = self._safe_text(self.tbl_do.item(r, 1), f"DO{ch}")
+            no_it = self.tbl_do.item(r, 2);  normally_open = (no_it.checkState() == QtCore.Qt.CheckState.Checked) if no_it else True
+            ms = self._safe_float(self.tbl_do.item(r, 3), 0.0)
+            inc_it = self.tbl_do.item(r, 4); include = (inc_it.checkState() == QtCore.Qt.CheckState.Checked) if inc_it else True
+            d = DigitalOutCfg(name=name, normallyOpen=bool(normally_open), momentary=False, actuationTime=float(ms))
+            setattr(d, "include", bool(include))
+            new_dos.append(d)
+        while len(new_dos) < MAX_DO:
+            d = DigitalOutCfg(name=f"DO{len(new_dos)}")
+            setattr(d, "include", True)
+            new_dos.append(d)
+        cfg.digitalOutputs = new_dos[:MAX_DO]
+
+        # ---- Analog Outputs ----
+        ao_rows = min(self.tbl_ao.rowCount(), MAX_AO)
+        new_aos: List[AnalogOutCfg] = []
+        for r in range(ao_rows):
+            ch = self.tbl_ao.cellWidget(r, 0).value() if self.tbl_ao.cellWidget(r, 0) else r
+            name = self._safe_text(self.tbl_ao.item(r, 1), f"AO{ch}")
+            minv = self._safe_float(self.tbl_ao.item(r, 2), -10.0)
+            maxv = self._safe_float(self.tbl_ao.item(r, 3), 10.0)
+            st = self._safe_float(self.tbl_ao.item(r, 4), 0.0)
+            inc_it = self.tbl_ao.item(r, 5); include = (inc_it.checkState() == QtCore.Qt.CheckState.Checked) if inc_it else True
+            a = AnalogOutCfg(name=name, minV=float(minv), maxV=float(maxv), startupV=float(st))
+            setattr(a, "include", bool(include))
+            new_aos.append(a)
+        while len(new_aos) < MAX_AO:
+            a = AnalogOutCfg(name=f"AO{len(new_aos)}")
+            setattr(a, "include", True)
+            new_aos.append(a)
+        cfg.analogOutputs = new_aos[:MAX_AO]
+
+        # ---- Thermocouples (pass-through list of dicts) ----
+        tc_rows = min(self.tbl_tc.rowCount(), MAX_TC)
+        tc_list = []
+        for r in range(tc_rows):
+            ch = self.tbl_tc.cellWidget(r, 0).value() if self.tbl_tc.cellWidget(r, 0) else r
+            name = self._safe_text(self.tbl_tc.item(r, 1), f"TC{ch}")
+            typ = "K"
+            if isinstance(self.tbl_tc.cellWidget(r, 2), QtWidgets.QComboBox):
+                typ = self.tbl_tc.cellWidget(r, 2).currentText().upper()
+            inc_it = self.tbl_tc.item(r, 3); include = (inc_it.checkState() == QtCore.Qt.CheckState.Checked) if inc_it else True
+            tc_list.append({"ch": int(ch), "name": name, "type": typ, "include": bool(include)})
+        cfg.thermocouples = tc_list
+
         return cfg
+
+    # Helpers
+    @staticmethod
+    def _safe_text(item: QtWidgets.QTableWidgetItem | None, default: str) -> str:
+        return item.text() if item and item.text() != "" else default
+
+    @staticmethod
+    def _safe_float(item: QtWidgets.QTableWidgetItem | None, default: float) -> float:
+        try:
+            return float(item.text()) if item and item.text() not in (None, "") else float(default)
+        except Exception:
+            return float(default)

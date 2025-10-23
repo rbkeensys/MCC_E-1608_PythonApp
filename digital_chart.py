@@ -1,80 +1,101 @@
-from PyQt6 import QtWidgets
+from PyQt6 import QtCore, QtWidgets
 import pyqtgraph as pg
 import numpy as np
 
+
 class DigitalChartWindow(QtWidgets.QMainWindow):
-    def __init__(self):
+    spanChanged = QtCore.pyqtSignal(float)
+
+    def __init__(self, names=None):
         super().__init__()
         self.setWindowTitle("Digital Outputs")
 
-        cw = QtWidgets.QWidget()
-        self.setCentralWidget(cw)
-        lay = QtWidgets.QVBoxLayout(cw)
+        self._names = list(names or [f"DO{i}" for i in range(8)])
 
+        cw = QtWidgets.QWidget(); self.setCentralWidget(cw)
+        lay = QtWidgets.QVBoxLayout(cw); lay.setContentsMargins(6, 6, 6, 6); lay.setSpacing(6)
+
+        # X-span
+        ctrl = QtWidgets.QWidget(); hl = QtWidgets.QHBoxLayout(ctrl)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.addWidget(QtWidgets.QLabel("X span (s):"))
+        self.sp_span = QtWidgets.QDoubleSpinBox()
+        self.sp_span.setRange(0.01, 100.0); self.sp_span.setDecimals(3); self.sp_span.setSingleStep(0.01); self.sp_span.setValue(5.0)
+        self.sp_span.valueChanged.connect(lambda v: self.spanChanged.emit(float(v)))
+        hl.addWidget(self.sp_span); hl.addStretch(1)
+        lay.addWidget(ctrl)
+
+        # One plot with step traces
         self.plot = pg.PlotWidget()
         pi = self.plot.getPlotItem()
         pi.showGrid(x=True, y=True, alpha=0.2)
-        pi.setLabel('bottom', 'Time (s)')
+        pi.showAxis('bottom', show=True)
+        vb = pi.getViewBox(); vb.setMenuEnabled(False); vb.setMouseEnabled(x=False, y=False)
+        lay.addWidget(self.plot, 1)
 
-        # FIXED SCALE + NO MOUSE INTERACTION (like v1.3)
-        vb = pi.getViewBox()
-        vb.setMenuEnabled(False)
-        vb.setMouseEnabled(x=False, y=False)       # disable drag/zoom
-        pi.enableAutoRange('x', False)
-        pi.enableAutoRange('y', False)
-
-        lay.addWidget(self.plot)
-
-        # 8 step-mode traces (one plot)
-        self.curves = [self.plot.plot([], [], stepMode=True, pen=pg.mkPen(width=2))
-                       for _ in range(8)]
-
-        # Vertical placement: top-to-bottom lanes, scaled to 85% band height so neighbors don’t touch
+        self.curves = []
+        self.offsets = np.array([], dtype=float)
         self.amp = 0.85
-        self.offsets = np.arange(8, dtype=float)[::-1]
+        self._ensure_rows(len(self._names))
 
-        # Set a fixed Y range that shows all lanes comfortably
-        y_min = self.offsets[-1] - 0.75
-        y_max = self.offsets[0] + 0.75
-        pi.setYRange(y_min, y_max, padding=0.0)
+    # ---------- Public API ----------
+    def set_span(self, seconds: float):
+        self.sp_span.blockSignals(True)
+        self.sp_span.setValue(float(seconds))
+        self.sp_span.blockSignals(False)
 
-    def set_data(self, x, states_0_1_history):
+    def set_names(self, names):
+        self._names = list(names or [])
+        self._ensure_rows(len(self._names))
+
+    def set_data(self, x, ys):
         """
-        x: array-like of time stamps (N)
-        states_0_1_history: list of 8 arrays (each N) with values 0/1
+        stepMode=True requires len(X) == len(Y) + 1.
+        We keep Y length 'n' and build X with length 'n+1'.
         """
         x = np.asarray(x, dtype=float)
-        N = x.size
-        if N == 0:
+        n = x.shape[0]
+        k = len(ys)
+        self._ensure_rows(k)
+        self._show_rows(k)
+
+        if n == 0:
+            for c in self.curves:
+                c.setData([], [])
             return
 
-        # For stepMode=True, X must be len(Y)+1 → build an 'edge' vector
-        if N == 1:
-            dx = 1e-3
+        # Build X of length n+1
+        if n >= 2 and np.isfinite(x[-1]) and np.isfinite(x[-2]):
+            dt = float(x[-1] - x[-2])
+            if not np.isfinite(dt) or dt == 0.0:
+                dt = 1.0
         else:
-            dx = x[-1] - x[-2]
-            if not np.isfinite(dx) or dx <= 0:
-                dx = (x[-1] - x[0]) / max(1, N - 1) if N > 1 else 1e-3
-                if dx <= 0:
-                    dx = 1e-3
-        x_edges = np.empty(N + 1, dtype=float)
-        x_edges[:-1] = x
-        x_edges[-1] = x[-1] + dx
+            dt = 1.0
+        xx = np.concatenate([x, [x[-1] + dt]])  # n+1
 
-        # Lock X range to the current window (still not draggable)
-        pi = self.plot.getPlotItem()
-        pi.setXRange(x_edges[0], x_edges[-1], padding=0.0)
+        # Each DO: Y must be length n (no pad!)
+        for i in range(k):
+            yy = np.asarray(ys[i], dtype=float)
+            if yy.shape[0] != n:
+                if yy.shape[0] > n:
+                    yy = yy[-n:]
+                else:
+                    yy = np.concatenate([np.full(n - yy.shape[0], np.nan), yy])
 
-        for i in range(8):
-            y = np.asarray(states_0_1_history[i], dtype=float)
+            on = (yy > 0.5).astype(float)  # length n
+            on = self.offsets[i] + self.amp * on
+            self.curves[i].setData(xx, on)  # X=n+1, Y=n
 
-            # align lengths defensively
-            if y.size != N:
-                n = min(y.size, N)
-                y = y[-n:]
-                xe = x_edges[-(n + 1):]
-            else:
-                xe = x_edges
+    # ---------- Internals ----------
+    def _ensure_rows(self, count: int):
+        cur = len(self.curves)
+        if count <= cur:
+            return
+        for _ in range(count - cur):
+            c = self.plot.plot([], [], stepMode=True, pen=pg.mkPen(width=2))
+            self.curves.append(c)
+        self.offsets = np.arange(len(self.curves), dtype=float)
 
-            # Map 0/1 to a band centered on the lane’s offset
-            self.curves[i].setData(x=xe, y=y * self.amp + self.offsets[i])
+    def _show_rows(self, k: int):
+        for i, c in enumerate(self.curves):
+            c.setVisible(i < k)
