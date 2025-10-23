@@ -589,10 +589,15 @@ class MainWindow(QtWidgets.QMainWindow):
         rgl.addWidget(self.btn_pid_reset, 8, 1, 1, 1)
 
         # ---- PID live table (up to 8 rows) ----
-        self.pid_table = QtWidgets.QTableWidget(0, 11, self)
+        self.pid_table = QtWidgets.QTableWidget(0, 14, self)
         self.pid_table.setHorizontalHeaderLabels([
-            "Enable", "Type", "AIch", "OUTch", "AIValue", "Target", "PID u", "OutputValue", "P", "I", "D"
+            "Enable", "Type", "Asrc","AIch", "OUTch", "AIValue", "Target", "PID u", "OutputValue", "P", "I", "D", "I lim", "Err Lim"
         ])
+        self.pid_table.setColumnWidth(0, 45)  # Enable (narrow ~1/3)
+        self.pid_table.setColumnWidth(1, 65)  # Analog / Digital type
+        self.pid_table.setColumnWidth(2, 55)  # Src (ai/tc) (narrow ~1/3)
+        self.pid_table.setColumnWidth(3, 60)  # AI ch (half)
+        self.pid_table.setColumnWidth(4, 60)  # OUT ch (half)
         self.pid_table.horizontalHeader().setStretchLastSection(True)
         rgl.addWidget(self.pid_table, 9, 0, 1, 2)
 
@@ -1570,8 +1575,11 @@ class MainWindow(QtWidgets.QMainWindow):
         loops = getattr(self.pid_mgr, "loops", [])
         self.pid_table.setRowCount(len(loops))
         self.pid_table.setColumnCount(11)
+        self.pid_table.setColumnCount(14)
         self.pid_table.setHorizontalHeaderLabels([
-            "Enable", "Type", "AIch", "OUTch", "AIValue", "Target", "CurrentError", "OutputValue", "P", "I", "D"
+            "Enable", "Type", "Src", "AIch", "OUTch",
+            "AIValue", "Target", "PID u", "OutputValue",
+            "P", "I", "D", "I limit", "Err limit"
         ])
         self.pid_table.horizontalHeader().setStretchLastSection(True)
 
@@ -1589,12 +1597,19 @@ class MainWindow(QtWidgets.QMainWindow):
             typ.currentTextChanged.connect(lambda text, row=r: self._pid_on_type_changed(row, text))
             self.pid_table.setCellWidget(r, 1, typ)
 
+            # Src (editable: ai|tc)
+            src = QtWidgets.QComboBox()
+            src.addItems(["ai", "tc"])
+            src.setCurrentText(getattr(lp, "src", "ai"))
+            src.currentTextChanged.connect(lambda text, row=r: self._pid_on_src_changed(row, text))
+            self.pid_table.setCellWidget(r, 2, src)
+
             # AI ch (editable)
             sp_ai = QtWidgets.QSpinBox()
-            sp_ai.setRange(0, 7)
+            sp_ai.setRange(0, 3)
             sp_ai.setValue(int(lp.ai_ch))
             sp_ai.valueChanged.connect(lambda val, row=r: self._pid_on_ai_changed(row, val))
-            self.pid_table.setCellWidget(r, 2, sp_ai)
+            self.pid_table.setCellWidget(r, 3, sp_ai)
 
             # OUT ch (editable; range depends on type)
             sp_out = QtWidgets.QSpinBox()
@@ -1604,12 +1619,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 sp_out.setRange(0, 7)
             sp_out.setValue(int(lp.out_ch))
             sp_out.valueChanged.connect(lambda val, row=r: self._pid_on_out_changed(row, val))
-            self.pid_table.setCellWidget(r, 3, sp_out)
+            self.pid_table.setCellWidget(r, 4, sp_out)
 
             # AIValue (read-only)
             it = QtWidgets.QTableWidgetItem("—");
             it.setFlags(_ro_flags(it.flags()))
-            self.pid_table.setItem(r, 4, it)
+            self.pid_table.setItem(r, 5, it)
 
             # Target (editable)
             dsp_tgt = QtWidgets.QDoubleSpinBox()
@@ -1618,7 +1633,7 @@ class MainWindow(QtWidgets.QMainWindow):
             dsp_tgt.setSingleStep(0.1)
             dsp_tgt.setValue(float(lp.target))
             dsp_tgt.valueChanged.connect(lambda val, row=r: self._pid_on_target_changed(row, val))
-            self.pid_table.setCellWidget(r, 5, dsp_tgt)
+            self.pid_table.setCellWidget(r, 6, dsp_tgt)
 
             # CurrentError (read-only)
             it = QtWidgets.QTableWidgetItem("—");
@@ -1631,7 +1646,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.pid_table.setItem(r, 7, it)
 
             # P/I/D (editable)
-            for c, key in enumerate(["kp", "ki", "kd"], start=8):
+            for c, key in enumerate(["kp", "ki", "kd"], start=9):
                 dsp = QtWidgets.QDoubleSpinBox()
                 dsp.setDecimals(6);
                 dsp.setRange(-1e6, 1e6);
@@ -1639,6 +1654,30 @@ class MainWindow(QtWidgets.QMainWindow):
                 dsp.setValue(float(getattr(lp, key)))
                 dsp.valueChanged.connect(lambda val, row=r, k=key: self._pid_on_gain_changed(row, k, val))
                 self.pid_table.setCellWidget(r, c, dsp)
+
+            # I limit (abs) — mirrors i_min/i_max symmetrically
+            dsp_i_abs = QtWidgets.QDoubleSpinBox()
+            dsp_i_abs.setDecimals(6);
+            dsp_i_abs.setRange(0.0, 1e12);
+            dsp_i_abs.setSingleStep(0.1)
+            cur_i = 0.0
+            if getattr(lp, "i_min", None) is not None and getattr(lp, "i_max", None) is not None:
+                cur_i = max(abs(float(lp.i_min)), abs(float(lp.i_max)))
+            dsp_i_abs.setValue(cur_i)
+            dsp_i_abs.valueChanged.connect(lambda val, row=r: self._pid_on_i_abs_changed(row, val))
+            self.pid_table.setCellWidget(r, 12, dsp_i_abs)
+
+            # Error limit (abs) — mirrors err_min/err_max symmetrically
+            dsp_err_abs = QtWidgets.QDoubleSpinBox()
+            dsp_err_abs.setDecimals(6);
+            dsp_err_abs.setRange(0.0, 1e12);
+            dsp_err_abs.setSingleStep(0.1)
+            cur_e = 0.0
+            if getattr(lp, "err_min", None) is not None and getattr(lp, "err_max", None) is not None:
+                cur_e = max(abs(float(lp.err_min)), abs(float(lp.err_max)))
+            dsp_err_abs.setValue(cur_e)
+            dsp_err_abs.valueChanged.connect(lambda val, row=r: self._pid_on_err_abs_changed(row, val))
+            self.pid_table.setCellWidget(r, 13, dsp_err_abs)
 
     def _pid_update_table_values(self):
         # Build a quick lookup of runtime objects by (kind, ai, out)
@@ -1689,7 +1728,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     else:
                         out_val = "—"
 
-            for col, txt in [(4, ai_val), (6, pid_val), (7, out_val)]:
+            for col, txt in [(5, ai_val), (7, pid_val), (8, out_val)]:
                 it = self.pid_table.item(r, col)
                 if it is None:
                     it = QtWidgets.QTableWidgetItem()
@@ -1714,7 +1753,7 @@ def _pid_on_type_changed(self, row, text):
     try:
         self.pid_mgr.loops[row].kind = text
         # adjust OUT range for this row
-        w = self.pid_table.cellWidget(row, 3)
+        w = self.pid_table.cellWidget(row, 4)
         if isinstance(w, QtWidgets.QSpinBox):
             if text == "analog":
                 w.setRange(0, 1)
@@ -1759,6 +1798,33 @@ def _pid_on_gain_changed(self, row, key, val):
     except Exception as e:
         self.log_rx(f"[PID] gain change failed: {e}")
 
+def _pid_on_src_changed(self, row, text):
+    try:
+        self.pid_mgr.loops[row].src = str(text)
+        self.pid_mgr.apply_loop_updates(row)
+        self._pid_update_table_values()
+    except Exception as e:
+        self.log_rx(f"[PID] src change failed: {e}")
+
+def _pid_on_i_abs_changed(self, row, val):
+    try:
+        v = abs(float(val))
+        lp = self.pid_mgr.loops[row]
+        lp.i_min, lp.i_max = -v, v
+        self.pid_mgr.apply_loop_updates(row)
+    except Exception as e:
+        self.log_rx(f"[PID] I-limit change failed: {e}")
+
+def _pid_on_err_abs_changed(self, row, val):
+    try:
+        v = abs(float(val))
+        lp = self.pid_mgr.loops[row]
+        lp.err_min, lp.err_max = -v, v
+        self.pid_mgr.apply_loop_updates(row)
+    except Exception as e:
+        self.log_rx(f"[PID] Err-limit change failed: {e}")
+
+
 
 # ---- Bind the standalone PID handlers to MainWindow (so self._pid_* works) ----
 MainWindow._pid_rebuild = _pid_rebuild
@@ -1768,6 +1834,9 @@ MainWindow._pid_on_ai_changed = _pid_on_ai_changed
 MainWindow._pid_on_out_changed = _pid_on_out_changed
 MainWindow._pid_on_target_changed = _pid_on_target_changed
 MainWindow._pid_on_gain_changed = _pid_on_gain_changed
+MainWindow._pid_on_src_changed = _pid_on_src_changed
+MainWindow._pid_on_i_abs_changed = _pid_on_i_abs_changed
+MainWindow._pid_on_err_abs_changed = _pid_on_err_abs_changed
 
 def main():
     app=QtWidgets.QApplication(sys.argv); w=MainWindow(); w.show(); return app.exec()

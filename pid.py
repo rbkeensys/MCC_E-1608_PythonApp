@@ -159,9 +159,8 @@ class PIDManager:
 
         allowed = {
             "enabled","kind","ai_ch","out_ch","target","kp","ki","kd",
-            "out_min","out_max","err_min","err_max","i_min","i_max"
+            "out_min","out_max","err_min","err_max","i_min","i_max","src"
         }
-        allowed = {..., "src", ...}
 
         for item in js.get("loops", []):
             # filter unknown keys so older/newer files don't break
