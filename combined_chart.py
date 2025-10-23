@@ -45,7 +45,8 @@ class CombinedChartWindow(QtWidgets.QMainWindow):
         span_layout.setContentsMargins(0,0,0,0); span_layout.setSpacing(8)
         span_layout.addWidget(QtWidgets.QLabel("X span (s):"))
         self.sp_span = QtWidgets.QDoubleSpinBox()
-        self.sp_span.setRange(0.01, 100.0); self.sp_span.setDecimals(3); self.sp_span.setSingleStep(0.01); self.sp_span.setValue(5.0)
+        # ↑ increase max to 3600s
+        self.sp_span.setRange(0.01, 3600.0); self.sp_span.setDecimals(3); self.sp_span.setSingleStep(0.01); self.sp_span.setValue(5.0)
         self.sp_span.valueChanged.connect(lambda v: self.spanChanged.emit(float(v)))
         span_layout.addWidget(self.sp_span); span_layout.addStretch(1)
         outer.addWidget(span_bar)
@@ -68,6 +69,9 @@ class CombinedChartWindow(QtWidgets.QMainWindow):
             top_v.addWidget(row)
             self.ai_rows[i] = row; self.ai_plots[i] = plt; self.ai_curves[i] = curve
             self.ai_locked[i] = False; self.ai_ranges[i] = (None, None)
+            # disable context menu; allow mouse zoom/pan; hook range + mouse
+            pi = plt.getPlotItem(); pi.getViewBox().setMenuEnabled(False)
+            self._hook_xrange(plt); self._install_cursor(plt); self._hook_mouse(plt)
 
         # TC
         top_v.addWidget(self._make_section_label("Thermocouples (°C)"))
@@ -87,6 +91,8 @@ class CombinedChartWindow(QtWidgets.QMainWindow):
             self.ao_locked[i] = True; self.ao_ranges[i] = (float(self._ao_default_range[0]), float(self._ao_default_range[1]))
             pi = plt.getPlotItem(); pi.enableAutoRange(axis='y', enable=False)
             pi.setYRange(self._ao_default_range[0], self._ao_default_range[1], padding=0.0)
+            pi.getViewBox().setMenuEnabled(False)
+            self._hook_xrange(plt); self._install_cursor(plt); self._hook_mouse(plt)
 
         splitter.addWidget(top)
 
@@ -98,9 +104,15 @@ class CombinedChartWindow(QtWidgets.QMainWindow):
         self.do_plot = pg.PlotWidget()
         dpi = self.do_plot.getPlotItem()
         dpi.showAxis('bottom', show=True)
-        vb = dpi.getViewBox(); vb.setMenuEnabled(False); vb.setMouseEnabled(x=False, y=False)
+        vb = dpi.getViewBox(); vb.setMenuEnabled(False); vb.setMouseEnabled(x=True, y=False)
         do_v.addWidget(self.do_plot)
         self._ensure_do_rows(8)
+        self._hook_xrange(self.do_plot); self._install_cursor(self.do_plot); self._hook_mouse(self.do_plot)
+
+        # follow-tail behavior (auto-scroll)
+        self._follow_tail = True
+        self._latest_x = None
+        self._suppress_range_cb = False
 
         splitter.addWidget(bottom)
         splitter.setStretchFactor(0, 4); splitter.setStretchFactor(1, 1)
@@ -108,9 +120,129 @@ class CombinedChartWindow(QtWidgets.QMainWindow):
         # Final sync (after rows exist)
         self._ctrl_sync("AI"); self._ctrl_sync("TC"); self._ctrl_sync("AO")
 
+        # Cursor mode
+        self._cursor_locked = False
+        self._cursor_x = None
+
     # ===== Public API =====
+    def set_follow_tail(self, enabled: bool):
+        self._follow_tail = bool(enabled)
+
+    def _hook_xrange(self, plt):
+        vb = plt.getPlotItem().getViewBox()
+        # On any x-range change: freeze unless near the latest sample
+        vb.sigXRangeChanged.connect(self._on_vb_xrange_changed)
+
+    def _on_vb_xrange_changed(self, vb, xrange):
+        if self._suppress_range_cb:
+            return
+        if self._latest_x is None:
+            return
+        _, x_max = xrange
+        span = float(self.sp_span.value())
+        tol = max(0.1 * span, 0.5)  # tolerance: near right edge ⇒ resume follow-tail
+        self._follow_tail = (x_max >= (self._latest_x - tol))
+
     def set_span(self, seconds: float):
         self.sp_span.blockSignals(True); self.sp_span.setValue(float(seconds)); self.sp_span.blockSignals(False)
+
+    # ----- Cursor: per-plot scenes -----
+    def _install_cursor(self, plt):
+        line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen((200, 0, 0), width=1))
+        line.setVisible(False)
+        plt.addItem(line)
+        if not hasattr(self, "_cursors"):
+            self._cursors = []
+        self._cursors.append({"plt": plt, "line": line})
+
+    def _hook_mouse(self, plt):
+        sc = plt.scene()
+        sc.sigMouseMoved.connect(lambda pos, p=plt: self._on_mouse_moved_in_plot(p, pos))
+        sc.sigMouseClicked.connect(lambda ev, p=plt: self._on_mouse_clicked_in_plot(p, ev))
+
+    def _on_mouse_moved_in_plot(self, plt, pos):
+        if self._cursor_locked:
+            return
+        vb = plt.getPlotItem().getViewBox()
+        if not vb.sceneBoundingRect().contains(pos):
+            # hide when outside
+            for c in getattr(self, "_cursors", []):
+                c["line"].setVisible(False)
+            return
+        mouse_point = vb.mapSceneToView(pos)
+        x = mouse_point.x()
+        self._cursor_x = x
+        # share X across all plots
+        for c in getattr(self, "_cursors", []):
+            c["line"].setPos(x); c["line"].setVisible(True)
+
+    def _on_mouse_clicked_in_plot(self, plt, ev):
+        pos = ev.scenePos()
+        if ev.button() == QtCore.Qt.MouseButton.LeftButton:
+            self._cursor_locked = not self._cursor_locked
+            if not self._cursor_locked:
+                self._on_mouse_moved_in_plot(plt, pos)
+            ev.accept()
+        elif ev.button() == QtCore.Qt.MouseButton.RightButton:
+            # pick current cursor X if visible anywhere
+            x = None
+            for c in getattr(self, "_cursors", []):
+                if c["line"].isVisible():
+                    x = c["line"].value(); break
+            if x is not None:
+                self._show_cursor_readout_dialog(float(x))
+            ev.accept()
+
+    def _show_cursor_readout_dialog(self, x):
+        # collect included values at x
+        rows = []
+        # AI (included = visible rows at top)
+        k_ai = sum(1 for r in self.ai_rows if r is not None and r.isVisible())
+        for i in range(k_ai):
+            nm = self._ai_names[i] if i < len(self._ai_names) else f"AI{i}"
+            val = self._value_at_x(self._x, self._ai_data[i]) if self._ai_data and i < len(self._ai_data) else None
+            rows.append((nm, val))
+        # TC
+        k_tc = sum(1 for r in self.tc_rows if r is not None and r.isVisible())
+        for i in range(k_tc):
+            nm = self._tc_names[i] if i < len(self._tc_names) else f"TC{i}"
+            val = self._value_at_x(self._x, self._tc_data[i]) if self._tc_data and i < len(self._tc_data) else None
+            rows.append((nm, val))
+        # AO
+        k_ao = sum(1 for r in self.ao_rows if r is not None and r.isVisible())
+        for i in range(k_ao):
+            nm = self._ao_names[i] if i < len(self._ao_names) else f"AO{i}"
+            val = self._value_at_x(self._x, self._ao_data[i]) if self._ao_data and i < len(self._ao_data) else None
+            rows.append((nm, val))
+        # DO (boolean lanes)
+        k_do = sum(1 for c in self.do_curves if c.isVisible())
+        for i in range(k_do):
+            nm = f"DO{i}"
+            val = self._value_at_x(self._x, self._do_data[i]) if self._do_data and i < len(self._do_data) else None
+            val = None if val is None else (1 if val > 0.5 else 0)
+            rows.append((nm, val))
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f"Values @ t={x:.3f}s")
+        lay = QtWidgets.QFormLayout(dlg)
+        for name, val in rows:
+            if val is None or (isinstance(val, float) and not np.isfinite(val)):
+                txt = "--"
+            else:
+                txt = f"{val:.6g}"
+            lay.addRow(QtWidgets.QLabel(name), QtWidgets.QLabel(txt))
+        dlg.resize(280, min(600, 24 * (len(rows) + 2)))
+        dlg.exec()
+
+    def _value_at_x(self, x_arr, y_arr):
+        if x_arr is None or y_arr is None or len(x_arr) == 0:
+            return None
+        i = int(np.searchsorted(x_arr, self._cursor_x if self._cursor_x is not None else x_arr[-1], side="left"))
+        i = max(0, min(i, len(x_arr) - 1))
+        try:
+            return float(y_arr[i])
+        except Exception:
+            return None
 
     def set_ai_names_units(self, names, units):
         self._ai_names = list(names or []); self._ai_units = list(units or [])
@@ -137,9 +269,17 @@ class CombinedChartWindow(QtWidgets.QMainWindow):
         self._ctrl_rebuild_items("AO", len(self._ao_names), self._ao_names)
 
     def set_data(self, x, ai_ys, ao_ys, do_ys, tc=None):
-        x = np.asarray(x, dtype=float); n = x.shape[0]
+        # Keep references for cursor/readout
+        self._x = np.asarray(x, dtype=float)
+        x = self._x
+        n = x.shape[0]
 
-        # --- AI (only included count is len(ai_ys))
+        self._ai_data = ai_ys
+        self._ao_data = ao_ys
+        self._do_data = do_ys
+        self._tc_data = tc
+
+        # --- AI (only included count = len(ai_ys))
         self._ensure_ai_rows(len(ai_ys))
         for i, y in enumerate(ai_ys):
             yy = np.asarray(y, dtype=float)
@@ -148,11 +288,13 @@ class CombinedChartWindow(QtWidgets.QMainWindow):
                 else: yy = np.concatenate([np.full(n - yy.shape[0], np.nan), yy])
             self.ai_curves[i].setData(x, yy)
             if self.ai_locked[i] and self.ai_ranges[i][0] is not None:
-                pi = self.ai_plots[i].getPlotItem(); pi.enableAutoRange(axis='y', enable=False)
-                ymin, ymax = self.ai_ranges[i]; pi.setYRange(float(ymin), float(ymax), padding=0.0)
+                pi = self.ai_plots[i].getPlotItem()
+                pi.enableAutoRange(axis='y', enable=False)
+                ymin, ymax = self.ai_ranges[i]
+                pi.setYRange(float(ymin), float(ymax), padding=0.0)
         self._show_ai_rows(len(ai_ys))
 
-        # --- TC (if provided)
+        # --- TC (optional)
         if tc is not None:
             self._ensure_tc_rows(len(tc))
             for i, y in enumerate(tc):
@@ -162,9 +304,13 @@ class CombinedChartWindow(QtWidgets.QMainWindow):
                     else: yy = np.concatenate([np.full(n - yy.shape[0], np.nan), yy])
                 self.tc_curves[i].setData(x, yy)
                 if self.tc_locked[i] and self.tc_ranges[i][0] is not None:
-                    pi = self.tc_plots[i].getPlotItem(); pi.enableAutoRange(axis='y', enable=False)
-                    ymin, ymax = self.tc_ranges[i]; pi.setYRange(float(ymin), float(ymax), padding=0.0)
+                    pi = self.tc_plots[i].getPlotItem()
+                    pi.enableAutoRange(axis='y', enable=False)
+                    ymin, ymax = self.tc_ranges[i]
+                    pi.setYRange(float(ymin), float(ymax), padding=0.0)
             self._show_tc_rows(len(tc))
+        else:
+            self._show_tc_rows(0)
 
         # --- AO
         self._ensure_ao_rows(len(ao_ys))
@@ -175,17 +321,23 @@ class CombinedChartWindow(QtWidgets.QMainWindow):
                 else: yy = np.concatenate([np.full(n - yy.shape[0], np.nan), yy])
             self.ao_curves[i].setData(x, yy)
             if self.ao_locked[i] and self.ao_ranges[i][0] is not None:
-                pi = self.ao_plots[i].getPlotItem(); pi.enableAutoRange(axis='y', enable=False)
-                ymin, ymax = self.ao_ranges[i]; pi.setYRange(float(ymin), float(ymax), padding=0.0)
+                pi = self.ao_plots[i].getPlotItem()
+                pi.enableAutoRange(axis='y', enable=False)
+                ymin, ymax = self.ao_ranges[i]
+                pi.setYRange(float(ymin), float(ymax), padding=0.0)
+        self._show_ao_rows(len(ao_ys))  # ensure only included AO rows visible
 
         # --- DO (step mode: len(X) == len(Y) + 1)
         self._ensure_do_rows(len(do_ys))
         if n == 0:
-            for c in self.do_curves: c.setData([], [])
+            for c in self.do_curves:
+                c.setData([], [])
             self._show_do_rows(0)
         else:
             if n >= 2 and np.isfinite(x[-1]) and np.isfinite(x[-2]):
-                dt = float(x[-1] - x[-2]);  dt = 1.0 if (not np.isfinite(dt) or dt == 0.0) else dt
+                dt = float(x[-1] - x[-2])
+                if not np.isfinite(dt) or dt == 0.0:
+                    dt = 1.0
             else:
                 dt = 1.0
             xx = np.concatenate([x, [x[-1] + dt]])  # n+1
@@ -194,10 +346,30 @@ class CombinedChartWindow(QtWidgets.QMainWindow):
                 if yy.shape[0] != n:
                     if yy.shape[0] > n: yy = yy[-n:]
                     else: yy = np.concatenate([np.full(n - yy.shape[0], np.nan), yy])
-                on = (yy > 0.5).astype(float)          # length n
+                # On/off → 0/1 → offset stack for lanes
+                on = (yy > 0.5).astype(float)
                 on = self.do_offsets[i] + self.do_amp * on
-                self.do_curves[i].setData(xx, on)     # X n+1, Y n
+                self.do_curves[i].setData(xx, on)
             self._show_do_rows(len(do_ys))
+
+        # latest X (for follow-tail)
+        self._latest_x = float(x[-1]) if n else None
+
+        # follow-tail auto-scroll (only if not frozen by manual zoom)
+        if self._follow_tail and n:
+            left = self._latest_x - float(self.sp_span.value())
+            right = self._latest_x
+            self._suppress_range_cb = True
+            try:
+                for plt in self.ai_plots:
+                    if plt: plt.getPlotItem().getViewBox().setXRange(left, right, padding=0.0)
+                for plt in self.tc_plots:
+                    if plt: plt.getPlotItem().getViewBox().setXRange(left, right, padding=0.0)
+                for plt in self.ao_plots:
+                    if plt: plt.getPlotItem().getViewBox().setXRange(left, right, padding=0.0)
+                self.do_plot.getPlotItem().getViewBox().setXRange(left, right, padding=0.0)
+            finally:
+                self._suppress_range_cb = False
 
     # ===== Helpers =====
     def _make_section_label(self, txt, margin_top="0px"):
@@ -333,6 +505,9 @@ class CombinedChartWindow(QtWidgets.QMainWindow):
                 row, plt, curve = self._make_scalar_row(name, unit)
                 self._top_v.insertWidget(insert_base + 1 + (i - cur), row)
                 self.tc_rows[i] = row; self.tc_plots[i] = plt; self.tc_curves[i] = curve
+                # hook new plot widgets
+                pi = plt.getPlotItem(); pi.getViewBox().setMenuEnabled(False)
+                self._hook_xrange(plt); self._install_cursor(plt); self._hook_mouse(plt)
 
     def _ensure_ao_rows(self, n):
         cur = len(self.ao_rows)
@@ -356,6 +531,10 @@ class CombinedChartWindow(QtWidgets.QMainWindow):
 
     def _show_tc_rows(self, k: int):
         for i, row in enumerate(self.tc_rows):
+            if row is not None: row.setVisible(i < k)
+
+    def _show_ao_rows(self, k: int):
+        for i, row in enumerate(self.ao_rows):
             if row is not None: row.setVisible(i < k)
 
     def _show_do_rows(self, k: int):

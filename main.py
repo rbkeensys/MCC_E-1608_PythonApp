@@ -4,8 +4,8 @@ import time
 import numpy as np
 from pid import PIDManager, PIDLoopDef
 import os
+from PyQt6 import QtCore, QtWidgets, QtGui
 
-from PyQt6 import QtCore, QtWidgets
 def _ro_flags(flags):
     try:
         # PyQt6
@@ -337,6 +337,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tc_hist_y = []              # list[deque] histories per TC channel (aligned to ai_hist_x)
         self.tc_titles = []              # list[str] "Name (TCx Type)"
 
+        # logging data fields
+        self.replay_mode = False
+        self._log_fp = None
+        self._log_writer = None
+        self._last_logged_t = None
+
         # Windows
         self.analog_win = AnalogChartWindow(
             [a.name for a in self.cfg.analogs],
@@ -417,6 +423,27 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.log_rx("[INFO] PID.json loaded.")
         except Exception as e:
             self.log_rx(f"[WARN] PID.json load failed: {e}")
+
+        # Add File menu actions for log save/load
+        mbar = self.menuBar()
+        file_menu = None
+        for act in mbar.actions():
+            if act.text().replace("&", "").lower() == "file":
+                file_menu = act.menu()
+                break
+        if file_menu is None:
+            file_menu = mbar.addMenu("&File")
+
+        act_start = QtGui.QAction("Start Logging…", self)
+        act_start.triggered.connect(self._on_start_logging_dialog)
+
+        act_stop = QtGui.QAction("Stop Logging", self)
+        act_stop.triggered.connect(self._on_stop_logging_dialog)
+
+        act_load = QtGui.QAction("Load Logged Data…", self)
+        act_load.triggered.connect(self._on_load_logged_data_dialog)
+
+        file_menu.addActions([act_start, act_stop, act_load])
 
         # Build/refresh the PID status table once at startup
         self._pid_refresh_table_structure()
@@ -565,7 +592,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # pid_menu.addAction(self.act_pid_load)
         # pid_menu.addAction(self.act_pid_save)
 
-
     def _build_central(self):
         cw=QtWidgets.QWidget(); self.setCentralWidget(cw); grid=QtWidgets.QGridLayout(cw)
         gb=QtWidgets.QGroupBox("Digital Outputs"); grid.addWidget(gb,0,0); gl=QtWidgets.QGridLayout(gb)
@@ -607,7 +633,7 @@ class MainWindow(QtWidgets.QMainWindow):
             s=QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal); s.setRange(-1000,1000); s.valueChanged.connect(lambda v, idx=i: self._on_ao_slider(idx, v)); rgl.addWidget(s,i*2+1,0,1,2)
             self.ao_labels.append(lab); self.ao_sliders.append(s)
         rgl.addWidget(QtWidgets.QLabel("Time window (s)"),4,0)
-        self.time_spin=QtWidgets.QDoubleSpinBox(); self.time_spin.setRange(0.01,100.0); self.time_spin.setDecimals(3); self.time_spin.setSingleStep(0.01); self.time_spin.setValue(self.time_window_s)
+        self.time_spin=QtWidgets.QDoubleSpinBox(); self.time_spin.setRange(0.01,3600.0); self.time_spin.setDecimals(3); self.time_spin.setSingleStep(0.01); self.time_spin.setValue(self.time_window_s)
         self.time_spin.valueChanged.connect(self._on_time_window); rgl.addWidget(self.time_spin,4,1)
         self.btn_connect=QtWidgets.QPushButton("Connect")
         self.btn_connect.clicked.connect(self._act_connect); rgl.addWidget(self.btn_connect,5,0)
@@ -1199,6 +1225,53 @@ class MainWindow(QtWidgets.QMainWindow):
         except DaqError as e:
             QtWidgets.QMessageBox.critical(self, "DAQ error", str(e))
 
+    def _on_start_logging_dialog(self):
+        # Prevent logging during replay
+        if getattr(self, "replay_mode", False):
+            QtWidgets.QMessageBox.information(
+                self, "Logging disabled",
+                "You are in replay mode. Return to live mode before starting logging."
+            )
+            return
+        # Stop an existing session if any
+        if getattr(self, "_log_writer", None):
+            self.stop_logging()
+        # Ask for a path
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Choose log file",
+            "",
+            "CSV Files (*.csv);;All Files (*)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        self.start_logging(path)
+
+    def _on_stop_logging_dialog(self):
+        if getattr(self, "_log_writer", None):
+            self.stop_logging()
+            QtWidgets.QMessageBox.information(self, "Logging stopped", "Data logging has been stopped.")
+        else:
+            QtWidgets.QMessageBox.information(self, "Not logging", "No active logging session to stop.")
+
+    def _on_load_logged_data_dialog(self):
+        # Stop any active logging first
+        if getattr(self, "_log_writer", None):
+            self.stop_logging()
+        # Ask for a file
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Load logged data",
+            "",
+            "CSV Files (*.csv);;All Files (*)",
+        )
+        if not path:
+            return
+        # Enter replay mode and load
+        self.load_data_file(path)
+
     def _on_time_window(self, v):
         self.time_window_s=float(v)
         self._on_span_changed(float(v))
@@ -1354,6 +1427,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.tc_win.set_names_units(tc_names_inc, ["°C"] * len(tc_names_inc))
                 self.tc_win.set_data(x_arr, tc_series)
 
+            self._maybe_log_tail(
+                x_arr, ys_cut_inc, ao_cut, do_cut_inc, tc_series,
+                ai_names=ai_names_inc,
+                tc_names=([self.tc_titles[i] for i, inc in enumerate(self.tc_include) if
+                           inc] if tc_series is not None else []),
+                ao_names=[getattr(a, "name", f"AO{i}") if a is not None else f"AO{i}" for i, a in
+                          enumerate(getattr(self.cfg, "analogs_out", [None, None]))],
+                do_names=do_names_inc
+            )
+
             if getattr(self, "combined_win", None) and self.combined_win.isVisible():
                 self.combined_win.set_data(x_arr, ys_cut_inc, ao_cut, do_cut_inc, tc=tc_series)
 
@@ -1481,6 +1564,127 @@ class MainWindow(QtWidgets.QMainWindow):
             trim=len(self.ai_hist_x)-max_pts; self.ai_hist_x=self.ai_hist_x[trim:]
             for i in range(8):
                 self.ai_hist_y[i]=self.ai_hist_y[i][trim:]; self.do_hist_y[i]=self.do_hist_y[i][trim:]
+
+    def load_data_file(self, path):
+        import csv
+        # Enter replay mode: stop logging, disable follow-tail
+        self.replay_mode = True
+        self.stop_logging()
+        self.combined_win.set_follow_tail(False)
+
+        # Read CSV (format from start_logging)
+        with open(path, "r", newline="") as f:
+            r = csv.reader(f)
+            hdr = next(r, [])
+            rows = list(r)
+
+        if not rows:
+            return
+
+        import numpy as np
+        cols = list(zip(*rows))
+        x = np.array([float(v) for v in cols[0]], dtype=float)
+
+        # Split columns back into groups by header names
+        def _find_spans(hdr, prefix):
+            return [i for i, h in enumerate(hdr) if h.startswith(prefix)]
+
+        # AI: names are exact analog names; pick those that match included set
+        ai_idxs = [i for i, h in enumerate(hdr) if h in [a.name for a in self.cfg.analogs if a.included]]
+        ai_ys = [np.array([float(v) if v != "" else np.nan for v in cols[i]]) for i in ai_idxs]
+
+        tc_idxs = [i for i, h in enumerate(hdr) if h.startswith("TC")]
+        tc_ys = [np.array([float(v) if v != "" else np.nan for v in cols[i]]) for i in tc_idxs]
+
+        ao_idxs = [i for i, h in enumerate(hdr) if h.startswith("AO")]
+        ao_ys = [np.array([float(v) if v != "" else np.nan for v in cols[i]]) for i in ao_idxs]
+
+        do_idxs = [i for i, h in enumerate(hdr) if h.startswith("DO")]
+        do_ys = [np.array([float(v) if v != "" else 0.0 for v in cols[i]]) for i in do_idxs]
+
+        # Push once (no auto-scroll)
+        self.combined_win.set_data(x, ai_ys, ao_ys, do_ys, tc=tc_ys)
+
+    # ---------- Logging helpers (header from the actual arrays you pass to charts) ----------
+
+    def start_logging(self, path: str):
+        import csv
+        if getattr(self, "replay_mode", False):
+            return
+        if getattr(self, "_log_writer", None):
+            self.stop_logging()
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        self._log_fp = open(path, "w", newline="")
+        self._log_writer = csv.writer(self._log_fp)
+        self._log_header_written = False
+        self._last_logged_t = None
+        self._t0_log = None  # <-- for zero-based time
+
+    def stop_logging(self):
+        try:
+            if getattr(self, "_log_fp", None):
+                self._log_fp.close()
+        except Exception:
+            pass
+        self._log_fp = None
+        self._log_writer = None
+        self._log_header_written = False
+        self._last_logged_t = None
+        self._t0_log = None
+
+    def _maybe_log_tail(self, x, ai_ys, ao_ys, do_ys, tc_ys,
+                        ai_names=None, tc_names=None, ao_names=None, do_names=None):
+        # Only in live mode & when logging
+        if getattr(self, "replay_mode", False):
+            return
+        if not getattr(self, "_log_writer", None):
+            return
+        if x is None or len(x) == 0:
+            return
+
+        # Establish zero-base on first write
+        if self._t0_log is None:
+            self._t0_log = float(x[0])
+
+        # Write header once (with names you passed to the charts)
+        if not self._log_header_written:
+            hdr = ["t_rel", "t"]
+            if ai_names: hdr += list(ai_names)
+            if tc_names: hdr += list(tc_names)
+            if ao_names: hdr += list(ao_names)
+            if do_names: hdr += list(do_names)
+            self._log_writer.writerow(hdr)
+            self._log_header_written = True
+
+        # Resume position
+        import bisect
+        xv = list(x)
+        start = 0 if self._last_logged_t is None else bisect.bisect_right(xv, self._last_logged_t)
+
+        def _num(y, i):
+            try:
+                v = y[i]
+                return float(v)
+            except Exception:
+                return ""
+
+        # Write rows
+        for i in range(start, len(x)):
+            t_abs = float(x[i])
+            t_rel = t_abs - self._t0_log
+            row = [t_rel, t_abs]
+            for y in (ai_ys or []): row.append(_num(y, i))
+            for y in (tc_ys or []): row.append(_num(y, i))
+            for y in (ao_ys or []): row.append(_num(y, i))
+            for y in (do_ys or []):
+                try:
+                    row.append(1 if float(y[i]) > 0.5 else 0)
+                except Exception:
+                    row.append("")
+            self._log_writer.writerow(row)
+
+        self._last_logged_t = float(x[-1])
 
     def _act_run_script(self):
         # Use whatever is currently in the editor buffer

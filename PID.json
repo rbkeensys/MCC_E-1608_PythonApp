@@ -1,7 +1,7 @@
 {
   "loops": [
     {
-      "enabled": false,
+      "enabled": true,
       "kind": "analog",
       "ai_ch": 1,
       "out_ch": 0,
@@ -15,7 +15,7 @@
       "err_max": 1.0,
       "i_min": -1.0,
       "i_max": 1.0,
-      "src": "ai"
+      "src": "tc"
     },
     {
       "enabled": true,
