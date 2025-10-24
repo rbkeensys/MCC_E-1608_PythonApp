@@ -593,8 +593,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # pid_menu.addAction(self.act_pid_save)
 
     def _build_central(self):
-        cw=QtWidgets.QWidget(); self.setCentralWidget(cw); grid=QtWidgets.QGridLayout(cw)
-        gb=QtWidgets.QGroupBox("Digital Outputs"); grid.addWidget(gb,0,0); gl=QtWidgets.QGridLayout(gb)
+        cw = QtWidgets.QWidget();
+        self.setCentralWidget(cw);
+        grid = QtWidgets.QGridLayout(cw)
+        gb = QtWidgets.QGroupBox("Digital Outputs")
+        gl = QtWidgets.QGridLayout(gb)
+        # ... build DO buttons into gl ...
+
         self.do_btns=[]; self.do_chk_no=[]; self.do_chk_mom=[]; self.do_time=[]
         for i in range(8):
             btn=QtWidgets.QPushButton(f"{i}: DO"); btn.setCheckable(True)
@@ -605,7 +610,22 @@ class MainWindow(QtWidgets.QMainWindow):
             chk_no=QtWidgets.QCheckBox("Normally Open"); gl.addWidget(chk_no,i,1); self.do_chk_no.append(chk_no)
             chk_m=QtWidgets.QCheckBox("Momentary"); gl.addWidget(chk_m,i,2); self.do_chk_mom.append(chk_m)
             sp=QtWidgets.QDoubleSpinBox(); sp.setSuffix(" s"); sp.setRange(0.0,3600.0); sp.setDecimals(3); sp.setSingleStep(0.1); sp.setValue(0.0); gl.addWidget(sp,i,3); self.do_time.append(sp)
-        right=QtWidgets.QGroupBox("Analog Outputs / Timebase / Script"); grid.addWidget(right,0,1); rgl=QtWidgets.QGridLayout(right)
+
+        right = QtWidgets.QGroupBox("Analog Outputs / Timebase / Script")
+        rgl = QtWidgets.QGridLayout(right)
+        # ... build right side controls (AO, time window, PID table, etc.) into rgl ...
+
+        # --- NEW splitter replacing side-by-side grid cells ---
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        splitter.addWidget(gb)
+        splitter.addWidget(right)
+        splitter.setHandleWidth(8)
+        splitter.setStretchFactor(0, 0)  # left side: don’t greedily expand
+        splitter.setStretchFactor(1, 1)  # right side: expand
+        gb.setMinimumWidth(220)  # prevent collapsing completely; tweak as you like
+
+        # occupy one cell spanning both columns
+        grid.addWidget(splitter, 0, 0, 1, 2)
 
         # ---- PID header row ----
         self.btn_pid_setup = QtWidgets.QPushButton("PID Setup…")
