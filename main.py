@@ -336,12 +336,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tc_include = []             # list[bool] include in charts
         self.tc_hist_y = []              # list[deque] histories per TC channel (aligned to ai_hist_x)
         self.tc_titles = []              # list[str] "Name (TCx Type)"
+        self.tc_offsets = []             # list[float] calibration offsets (°C) per TC (same order as config)
 
         # logging data fields
         self.replay_mode = False
         self._log_fp = None
         self._log_writer = None
         self._last_logged_t = None
+        self._acq_worker_does_cal = False
 
         # Windows
         self.analog_win = AnalogChartWindow(
@@ -375,6 +377,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ao_units=ao_units,
             ao_default_range=(0.0, 10.0),
         )
+        self.combined_win.btn_reset.clicked.connect(self._exit_replay_to_live)
 
         # Build UI
         self._build_menu()
@@ -553,6 +556,65 @@ class MainWindow(QtWidgets.QMainWindow):
         # Make sure histories are large enough for the new span
         self._rebuild_histories_for_span()
 
+    def _exit_replay_to_live(self):
+        if not getattr(self, "replay_mode", False):
+            return
+        self.replay_mode = False
+        # Restore Combined names/units from the current config
+        self.combined_win.set_ai_names_units(
+            [a.name for a in self.cfg.analogs],
+            [a.units for a in self.cfg.analogs],
+        )
+        # AO names/units
+        ao_names = []
+        ao_units = []
+        if hasattr(self.cfg, "aouts"):
+            for i in range(2):
+                nm = getattr(self.cfg.aouts[i], "name", f"AO{i}") if i < len(self.cfg.aouts) else f"AO{i}"
+                un = getattr(self.cfg.aouts[i], "units", "")
+                ao_names.append(nm);
+                ao_units.append(un)
+        else:
+            for i in range(2):
+                nm = getattr(self.cfg, f"ao{i}Name", f"AO{i}")
+                un = getattr(self.cfg, f"ao{i}Units", "")
+                ao_names.append(nm);
+                ao_units.append(un)
+        self.combined_win.set_ao_names_units(ao_names, ao_units)
+
+        # TC titles back from config (included subset will be applied by _render)
+        self.combined_win.set_tc_names_units(getattr(self, "tc_titles", []),
+                                             ["°C"] * len(getattr(self, "tc_titles", [])))
+
+        # Follow tail again; the Combined Reset button already re-centers X/Y and clears cursor
+        self.combined_win.set_follow_tail(True)
+        # Immediately push one live frame so the view isn’t blank until next timer tick
+        try:
+            x_arr = np.asarray(self.ai_hist_x, dtype=float)
+            # Recompute live “include” slices exactly like _render
+            ai_cfg = list(getattr(self.cfg, "analogs", []))
+            ai_includes = [getattr(a, "include", True) for a in ai_cfg]
+            ys_cut = []
+            for dq in self.ai_hist_y:
+                ys_cut.append(np.asarray(dq, dtype=float))
+            ys_cut_inc = [ys_cut[i] for i, inc in enumerate(ai_includes) if inc and i < len(ys_cut)]
+
+            do_cfg = list(getattr(self.cfg, "digitalOutputs", []))
+            do_includes = [getattr(d, "include", True) for d in do_cfg]
+            do_cut = [np.asarray(dq, dtype=float) for dq in self.do_hist_y]
+            do_cut_inc = [do_cut[i] for i, inc in enumerate(do_includes) if inc and i < len(do_cut)]
+
+            ao_cut = [np.asarray(dq, dtype=float) for dq in self.ao_hist_y]
+
+            tc_series = None
+            if getattr(self, "tc_hist_y", None):
+                raw_tc = [np.asarray(dq, dtype=float) for dq in self.tc_hist_y]
+                tc_series = [raw_tc[i] for i, inc in enumerate(self.tc_include) if inc]
+
+            self.combined_win.set_data(x_arr, ys_cut_inc, ao_cut, do_cut_inc, tc=tc_series)
+        except Exception:
+            pass
+
     def _build_menu(self):
         m=self.menuBar(); f=m.addMenu("&File")
         f.addAction("Load Config...", self._act_load_cfg)
@@ -730,6 +792,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
             # --- Thermocouples (E-TC) from cfg ---
             tcs = getattr(self.cfg, "thermocouples", [])
+            # reset TC lists every time we apply config
             self.tc_enabled, self.tc_types, self.tc_names, self.tc_include = [], [], [], []
             self.tc_hist_y = []
             for item in tcs:
@@ -737,10 +800,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 name = str(item.get("name", f"TC{ch}"))
                 ttype = str(item.get("type", "K")).upper()
                 include = bool(item.get("include", True))
+                offset = float(item.get("offset", 0.0))  # <-- NEW (°C)
                 self.tc_enabled.append(ch)
                 self.tc_types.append(ttype)
                 self.tc_names.append(name)
                 self.tc_include.append(include)
+                self.tc_offsets.append(offset)  # <-- NEW
                 self.tc_hist_y.append(self._mk_deque())
 
             self.tc_titles = [f"{self.tc_names[i]} (TC{self.tc_enabled[i]} {self.tc_types[i]})" for i in
@@ -1187,6 +1252,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.daq = None
             self.etc = None
             self.btn_connect.setText("Connect")
+            self._acq_worker_does_cal = False
             return
 
         # Connect path
@@ -1228,6 +1294,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.acq_thread = AcqWorker(self.daq, slopes, offsets, cutoffs, actual_rate, self)
             self.acq_thread.chunkReady.connect(self._on_chunk_ready, QtCore.Qt.ConnectionType.QueuedConnection)
             self.acq_thread.start()
+            self._acq_worker_does_cal = True
 
             # Reset histories and the queue
             self.ai_hist_x.clear()
@@ -1457,8 +1524,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 do_names=do_names_inc
             )
 
-            if getattr(self, "combined_win", None) and self.combined_win.isVisible():
-                self.combined_win.set_data(x_arr, ys_cut_inc, ao_cut, do_cut_inc, tc=tc_series)
+            # In replay mode, do NOT overwrite the loaded frame in the Combined window
+            if not getattr(self, "replay_mode", False):
+                if getattr(self, "combined_win", None) and self.combined_win.isVisible():
+                    self.combined_win.set_data(x_arr, ys_cut_inc, ao_cut, do_cut_inc, tc=tc_series)
 
         except Exception as e:
             self.log_rx(f"Render error: {e}")
@@ -1488,12 +1557,30 @@ class MainWindow(QtWidgets.QMainWindow):
                 arr = arr.reshape(1, -1)
             num_ch, M = int(arr.shape[0]), int(arr.shape[1])
 
-            # --- Read a thermocouple block (hold values across M samples) ---
+            # --- Apply per-channel slope/offset (unless the worker already did) ---
+            if not (getattr(self, "_acq_worker_does_cal", False) or bool(payload.get("cal_applied", False))):
+                try:
+                    # Build slope/offset vectors from config (default slope=1.0, offset=0.0)
+                    cfg_as = getattr(self.cfg, "analogs", [])
+                    slopes = [getattr(a, "slope", 1.0) for a in cfg_as[:num_ch]]
+                    offsets = [getattr(a, "offset", 0.0) for a in cfg_as[:num_ch]]
+
+                    # Pad if fewer config entries than channels in the block
+                    if len(slopes) < num_ch:
+                        slopes += [1.0] * (num_ch - len(slopes))
+                        offsets += [0.0] * (num_ch - len(offsets))
+
+                    # Vectorized apply: (num_ch, M) * (num_ch,1) + (num_ch,1)
+                    s = np.asarray(slopes, dtype=float).reshape(-1, 1)
+                    o = np.asarray(offsets, dtype=float).reshape(-1, 1)
+                    arr = arr * s + o
+                except Exception as e:
+                    self.log_rx(f"[AI cal] slope/offset apply failed: {e}")
+
+            # --- Read a thermocouple block ONCE for this AI block ---
             tc_block_2d = None
             try:
-                if self.etc and self.etc.connected and self.tc_enabled:
-                    # Select only included TC channels for charts; PIDs can still use any TC index by config order
-                    # Build ordered channel/type lists for the E-TC read
+                if self.etc and getattr(self.etc, "connected", False) and self.tc_enabled:
                     enabled_chs = self.tc_enabled
                     tc_types = self.tc_types
                     tc_block_2d, _nchtc = self.etc.read_block(enabled_chs, tc_types, M, sp)  # (M, n_tc)
@@ -1501,10 +1588,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.log_rx(f"[E-TC] read error: {e}")
                 tc_block_2d = None
 
-            # --- PID: run loops on this block and apply outputs ---
+            # Apply per-channel TC calibration offsets (°C) if present
+            if tc_block_2d is not None and self.tc_offsets:
+                try:
+                    n_tc_cols = tc_block_2d.shape[1]
+                    offs = np.asarray(self.tc_offsets[:n_tc_cols], dtype=float)[None, :]  # shape (1, n_tc)
+                    tc_block_2d = tc_block_2d + offs
+                except Exception as e:
+                    self.log_rx(f"[E-TC] offset apply failed: {e}")
+
+            # --- PID: run loops on this block and apply outputs (use calibrated TC) ---
             try:
-                # ai_block_2d shape must be (nsamples, nch)
-                ai_block_2d = arr.T  # we currently have (nch, M) -> transpose
+                # ai_block_2d shape must be (nsamples, nch); we have (nch, M)
                 do_updates, ao_updates = self.pid_mgr.process_block(arr.T, float(sp), tc_block_2d=tc_block_2d)
 
                 # Apply DO updates ONLY if that channel is currently controlled by an enabled loop
@@ -1533,24 +1628,13 @@ class MainWindow(QtWidgets.QMainWindow):
             # Append to histories
             self.ai_hist_x.extend(x_block.tolist())
 
-            # --- Read a TC block (hold last values across this AI block) ---
-            tc_block_2d = None
-            try:
-                if self.etc and getattr(self.etc, "connected", False) and self.tc_enabled:
-                    enabled_chs = self.tc_enabled
-                    tc_types = self.tc_types
-                    tc_block_2d, _nchtc = self.etc.read_block(enabled_chs, tc_types, M, sp)  # (M, n_tc)
-            except Exception as e:
-                self.log_rx(f"[E-TC] read error: {e}")
-                tc_block_2d = None
-
-            # --- Extend TC histories ---
+            # --- Extend TC histories (calibrated values) ---
             if tc_block_2d is not None:
                 n_tc = tc_block_2d.shape[1]
                 for i in range(n_tc):
                     self.tc_hist_y[i].extend(tc_block_2d[:, i].tolist())
 
-            # AI channels; if fewer channels scanned, pad remaining with NaNs
+            # --- AI histories (already slope/offset calibrated) ---
             for ch in range(8):
                 if ch < num_ch:
                     self.ai_hist_y[ch].extend(arr[ch, :].tolist())
@@ -1586,7 +1670,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.ai_hist_y[i]=self.ai_hist_y[i][trim:]; self.do_hist_y[i]=self.do_hist_y[i][trim:]
 
     def load_data_file(self, path):
-        import csv
+        import csv, numpy as np
         # Enter replay mode: stop logging, disable follow-tail
         self.replay_mode = True
         self.stop_logging()
@@ -1597,33 +1681,95 @@ class MainWindow(QtWidgets.QMainWindow):
             r = csv.reader(f)
             hdr = next(r, [])
             rows = list(r)
-
-        if not rows:
+        if not rows or len(hdr) < 3:
             return
 
-        import numpy as np
         cols = list(zip(*rows))
+        # Col0: t_rel, Col1: t_abs, remainder: signals
         x = np.array([float(v) for v in cols[0]], dtype=float)
+
+        if len(x):
+            vb = self.combined_win.do_plot.getPlotItem().getViewBox()
+            vb.setXRange(float(x[0]), float(x[-1]), padding=0.0)
+        # Optionally reflect this span in the spinbox without emitting change
+        try:
+            self.combined_win.sp_span.blockSignals(True)
+            self.combined_win.sp_span.setValue(float(x[-1] - x[0]))
+        finally:
+            self.combined_win.sp_span.blockSignals(False)
 
         # Split columns back into groups by header names
         def _find_spans(hdr, prefix):
             return [i for i, h in enumerate(hdr) if h.startswith(prefix)]
 
-        # AI: names are exact analog names; pick those that match included set
-        ai_idxs = [i for i, h in enumerate(hdr) if h in [a.name for a in self.cfg.analogs if a.include]]
-        ai_ys = [np.array([float(v) if v != "" else np.nan for v in cols[i]]) for i in ai_idxs]
+        # Split columns back into groups by header names
 
-        tc_idxs = [i for i, h in enumerate(hdr) if h.startswith("TC")]
-        tc_ys = [np.array([float(v) if v != "" else np.nan for v in cols[i]]) for i in tc_idxs]
+        # Build name sets from current config (best-effort; names might differ)
+        ai_name_set = set(getattr(a, "name", f"AI{i}") for i, a in enumerate(getattr(self.cfg, "analogs", [])))
+        tc_name_set = set(getattr(self, "tc_titles", []) or getattr(self, "tc_names", []))
+        ao_name_set = set(
+            getattr(a, "name", f"AO{i}") for i, a in enumerate(getattr(self.cfg, "analogs_out", [None, None])))
+        do_name_set = set(getattr(d, "name", f"DO{i}") for i, d in enumerate(getattr(self.cfg, "digitalOutputs", [])))
 
-        ao_idxs = [i for i, h in enumerate(hdr) if h.startswith("AO")]
-        ao_ys = [np.array([float(v) if v != "" else np.nan for v in cols[i]]) for i in ao_idxs]
+        # First pass: exact name membership
+        data_hdr = hdr[2:]  # all signal names
+        data_idxs = list(range(2, len(hdr)))  # their indices
+        ai_idxs = [2 + i for i, h in enumerate(data_hdr) if h in ai_name_set]
+        tc_idxs = [2 + i for i, h in enumerate(data_hdr) if h in tc_name_set]
+        ao_idxs = [2 + i for i, h in enumerate(data_hdr) if h in ao_name_set]
+        do_idxs = [2 + i for i, h in enumerate(data_hdr) if h in do_name_set]
 
-        do_idxs = [i for i, h in enumerate(hdr) if h.startswith("DO")]
-        do_ys = [np.array([float(v) if v != "" else 0.0 for v in cols[i]]) for i in do_idxs]
+        # Fallback: anything not matched goes to AI (so nothing is lost)
+        matched = set(ai_idxs) | set(tc_idxs) | set(ao_idxs) | set(do_idxs)
+        leftover = [i for i in data_idxs if i not in matched]
+        ai_idxs += leftover
 
-        # Push once (no auto-scroll)
+        # Extract arrays
+        def _colf(i, as_bool=False):
+            raw = [v for v in cols[i]]
+            if as_bool:
+                return np.array([1.0 if (v != "" and float(v) > 0.5) else 0.0 for v in raw], dtype=float)
+            else:
+                return np.array([float(v) if v != "" else np.nan for v in raw], dtype=float)
+
+        ai_ys = [_colf(i) for i in ai_idxs]
+        tc_ys = [_colf(i) for i in tc_idxs]
+        ao_ys = [_colf(i) for i in ao_idxs]
+        do_ys = [_colf(i, as_bool=True) for i in do_idxs]
+
+        # Rebuild Combined’s names/units to match the file
+        ai_names = [hdr[i] for i in ai_idxs]
+        tc_names = [hdr[i] for i in tc_idxs]
+        ao_names = [hdr[i] for i in ao_idxs]
+        do_names = [hdr[i] for i in do_idxs]  # (used in popup list)
+
+        if not self.combined_win.isVisible():
+            self.combined_win.show()
+
+        # Update section titles (creates rows if there are more series than in config)
+        self.combined_win.set_ai_names_units(ai_names, [""] * len(ai_names))
+        self.combined_win.set_tc_names_units(tc_names, ["°C"] * len(tc_names))
+        self.combined_win.set_ao_names_units(ao_names, [""] * len(ao_names))
+
+        # Ensure drawing happens now (not paused)
+        self.combined_win._paused = False
+
+        # Push the data once
         self.combined_win.set_data(x, ai_ys, ao_ys, do_ys, tc=tc_ys)
+
+        # Show full-span X on the DO plot (others are X-linked)
+        if len(x):
+            vb = self.combined_win.do_plot.getPlotItem().getViewBox()
+            vb.setXRange(float(x[0]), float(x[-1]), padding=0.0)
+            try:
+                self.combined_win.sp_span.blockSignals(True)
+                self.combined_win.sp_span.setValue(max(0.01, float(x[-1] - x[0])))
+            finally:
+                self.combined_win.sp_span.blockSignals(False)
+
+        # Optional: give the user some feedback
+        self.log_rx(
+            f"[INFO] Loaded log: {path}  ({len(x)} samples, {len(ai_ys)} AI, {len(tc_ys)} TC, {len(ao_ys)} AO, {len(do_ys)} DO)")
 
     # ---------- Logging helpers (header from the actual arrays you pass to charts) ----------
 

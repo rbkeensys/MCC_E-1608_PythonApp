@@ -108,9 +108,21 @@ class CombinedChartWindow(QtWidgets.QMainWindow):
         self._ensure_tc_rows(0, build_ui=True)
 
         # Add containers in precise order
-        top_v.addWidget(self._ai_box)
-        top_v.addWidget(self._ao_box)
-        top_v.addWidget(self._tc_box)
+        # Add containers in precise order WITH a vertical splitter so each can be resized
+        self._sec_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        self._sec_splitter.setHandleWidth(8)
+        self._sec_splitter.setChildrenCollapsible(False)
+
+        self._sec_splitter.addWidget(self._ai_box)
+        self._sec_splitter.addWidget(self._ao_box)
+        self._sec_splitter.addWidget(self._tc_box)
+
+        # Give AI most space, then TC, then AO by default (tweak to taste)
+        self._sec_splitter.setStretchFactor(0, 3)  # AI
+        self._sec_splitter.setStretchFactor(1, 1)  # AO
+        self._sec_splitter.setStretchFactor(2, 2)  # TC
+
+        top_v.addWidget(self._sec_splitter)
 
         splitter.addWidget(top)
 
@@ -191,12 +203,6 @@ class CombinedChartWindow(QtWidgets.QMainWindow):
             unit_txt = f" [{self._ao_units[i]}]" if i < len(self._ao_units) and self._ao_units[i] else ""
             self.ao_plots[i].getPlotItem().setTitle(f"{self._ao_names[i]}{unit_txt}")
         self._link_all_x_to_do()
-
-    def _link_all_x_to_do(self):
-        if not hasattr(self, "do_plot") or not self.do_plot:
-            return
-        for plt in self._all_plots_except_do():
-            plt.setXLink(self.do_plot)
 
     # ===== Core render =====
     def set_data(self, x, ai_ys, ao_ys, do_ys, tc=None):
@@ -291,13 +297,15 @@ class CombinedChartWindow(QtWidgets.QMainWindow):
         if self._follow_tail and n:
             left = self._latest_x - float(self.sp_span.value())
             right = self._latest_x
-            self._suppress_range_cb = True
-            try:
-                for plt in self._all_plots_except_do():
-                    plt.getPlotItem().getViewBox().setXRange(left, right, padding=0.0)
-                self.do_plot.getPlotItem().getViewBox().setXRange(left, right, padding=0.0)
-            finally:
-                self._suppress_range_cb = False
+            vb = self.do_plot.getPlotItem().getViewBox()
+            (cur_left, cur_right), _ = vb.viewRange()
+            # update only if it actually changed (prevents jitter)
+            if abs(cur_left - left) > 1e-9 or abs(cur_right - right) > 1e-9:
+                self._suppress_range_cb = True
+                try:
+                    vb.setXRange(left, right, padding=0.0)
+                finally:
+                    self._suppress_range_cb = False
 
         # Keep cursor under mouse after refresh
         self._sync_cursor_to_mouse()
@@ -363,11 +371,12 @@ class CombinedChartWindow(QtWidgets.QMainWindow):
         vb.sigXRangeChanged.connect(self._on_vb_xrange_changed)
 
     def _on_vb_xrange_changed(self, vb, xrange):
+        # Ignore programmatic range changes while auto-following; we set the range in set_data().
         if self._suppress_range_cb:
             return
-        # Only freeze follow-tail if the user is actively interacting
-        if self._user_interacting:
-            self._follow_tail = False
+        if self._follow_tail and not self._paused:
+            return
+        # When paused (or follow-tail disabled), still keep the cursor synced.
         self._sync_cursor_to_mouse()
 
     def _install_cursor(self, plt):
@@ -593,7 +602,6 @@ class CombinedChartWindow(QtWidgets.QMainWindow):
                     if hasattr(self, "do_plot") and self.do_plot:
                         plt.setXLink(self.do_plot)
                     pi = self.ao_plots[i].getPlotItem()
-
                     pi.enableAutoRange(axis='y', enable=False)
                     pi.setYRange(self._ao_default_range[0], self._ao_default_range[1], padding=0.0)
 

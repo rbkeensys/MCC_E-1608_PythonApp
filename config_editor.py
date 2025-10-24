@@ -101,7 +101,7 @@ class ConfigEditorDialog(QtWidgets.QDialog):
         self.tbl_ai = QtWidgets.QTableWidget()
         self.tbl_ai.setColumnCount(7)
         self.tbl_ai.setHorizontalHeaderLabels(["Channel","Name","Slope","Offset","Cutoff Hz","Units","Include"])
-        self.tbl_ai.horizontalHeader().setStretchLastSection(True)
+        self.tbl_ai.horizontalHeader().setStretchLastSection(False)
         v.addWidget(self.tbl_ai)
 
         # Buttons
@@ -157,7 +157,7 @@ class ConfigEditorDialog(QtWidgets.QDialog):
         self.tbl_do = QtWidgets.QTableWidget()
         self.tbl_do.setColumnCount(5)
         self.tbl_do.setHorizontalHeaderLabels(["Channel","Name","Normally Open","Momentary (ms)","Include"])
-        self.tbl_do.horizontalHeader().setStretchLastSection(True)
+        self.tbl_do.horizontalHeader().setStretchLastSection(False)
         v.addWidget(self.tbl_do)
 
         hb = QtWidgets.QHBoxLayout(); hb.addStretch(1)
@@ -214,7 +214,7 @@ class ConfigEditorDialog(QtWidgets.QDialog):
         self.tbl_ao = QtWidgets.QTableWidget()
         self.tbl_ao.setColumnCount(6)
         self.tbl_ao.setHorizontalHeaderLabels(["Channel","Name","Min V","Max V","Startup V","Include"])
-        self.tbl_ao.horizontalHeader().setStretchLastSection(True)
+        self.tbl_ao.horizontalHeader().setStretchLastSection(False)
         v.addWidget(self.tbl_ao)
 
         rows = max(len(getattr(cfg, "analogOutputs", [])), MAX_AO)
@@ -241,17 +241,21 @@ class ConfigEditorDialog(QtWidgets.QDialog):
 
     # ===================== Thermocouples (E-TC) =====================
     def _build_tab_tc(self, cfg: AppConfig):
-        w = QtWidgets.QWidget(); v = QtWidgets.QVBoxLayout(w)
+        w = QtWidgets.QWidget();
+        v = QtWidgets.QVBoxLayout(w)
         self.tbl_tc = QtWidgets.QTableWidget()
-        self.tbl_tc.setColumnCount(4)
-        self.tbl_tc.setHorizontalHeaderLabels(["Channel","Name","Type","Include"])
-        self.tbl_tc.horizontalHeader().setStretchLastSection(True)
+        # Columns: Include | Ch | Name | Type | Offset
+        self.tbl_tc.setColumnCount(5)
+        self.tbl_tc.setHorizontalHeaderLabels(["Include", "Ch", "Name", "Type", "Offset (°C)"])
+        self.tbl_tc.horizontalHeader().setStretchLastSection(False)
         v.addWidget(self.tbl_tc)
 
-        hb = QtWidgets.QHBoxLayout(); hb.addStretch(1)
+        hb = QtWidgets.QHBoxLayout();
+        hb.addStretch(1)
         self.btn_tc_add = QtWidgets.QPushButton("Add")
         self.btn_tc_remove = QtWidgets.QPushButton("Remove")
-        hb.addWidget(self.btn_tc_add); hb.addWidget(self.btn_tc_remove)
+        hb.addWidget(self.btn_tc_add);
+        hb.addWidget(self.btn_tc_remove)
         v.addLayout(hb)
 
         tc_list = list(getattr(cfg, "thermocouples", []))
@@ -260,39 +264,53 @@ class ConfigEditorDialog(QtWidgets.QDialog):
         # if no entries, start empty (user can Add)
         for r in range(min(rows, MAX_TC)):
             d = tc_list[r] or {}
-            self._tc_set_row(r,
-                             ch=int(d.get("ch", r)),
-                             name=str(d.get("name", f"TC{r}")),
-                             typ=str(d.get("type", "K")).upper(),
-                             include=bool(d.get("include", True)))
+            self._tc_set_row(
+                r,
+                include=bool(d.get("include", True)),
+                ch=int(d.get("ch", r)),
+                name=str(d.get("name", f"TC{r}")),
+                typ=str(d.get("type", "K")).upper(),
+                offset=float(d.get("offset", 0.0)),
+            )
 
         self.btn_tc_add.clicked.connect(self._tc_on_add)
         self.btn_tc_remove.clicked.connect(self._tc_on_remove)
 
         self.tabs.addTab(w, "Thermocouples (E-TC)")
 
-    def _tc_set_row(self, row: int, ch: int, name: str, typ: str, include: bool):
-        sp = QtWidgets.QSpinBox(); sp.setRange(0, MAX_TC - 1); sp.setValue(int(ch))
-        self.tbl_tc.setCellWidget(row, 0, sp)
-
-        self.tbl_tc.setItem(row, 1, QtWidgets.QTableWidgetItem(name))
-        cb = QtWidgets.QComboBox(); cb.addItems(["J","K","T","E","N","B","R","S"])
-        if typ.upper() not in ["J","K","T","E","N","B","R","S"]:
-            typ = "K"
-        cb.setCurrentText(typ.upper())
-        self.tbl_tc.setCellWidget(row, 2, cb)
-
+    def _tc_set_row(self, row: int, include: bool, ch: int, name: str, typ: str, offset: float):
+        # 0: Include (check)
         inc = QtWidgets.QTableWidgetItem()
         inc.setFlags(inc.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
         inc.setCheckState(QtCore.Qt.CheckState.Checked if include else QtCore.Qt.CheckState.Unchecked)
-        self.tbl_tc.setItem(row, 3, inc)
+        self.tbl_tc.setItem(row, 0, inc)
+
+        # 1: Channel (spin)
+        sp = QtWidgets.QSpinBox();
+        sp.setRange(0, MAX_TC - 1);
+        sp.setValue(int(ch))
+        self.tbl_tc.setCellWidget(row, 1, sp)
+
+        # 2: Name (text)
+        self.tbl_tc.setItem(row, 2, QtWidgets.QTableWidgetItem(name))
+
+        # 3: Type (combo)
+        cb = QtWidgets.QComboBox();
+        cb.addItems(["J", "K", "T", "E", "N", "B", "R", "S"])
+        if typ.upper() not in ["J", "K", "T", "E", "N", "B", "R", "S"]:
+            typ = "K"
+        cb.setCurrentText(typ.upper())
+        self.tbl_tc.setCellWidget(row, 3, cb)
+
+        # 4: Offset (°C) (number)
+        self.tbl_tc.setItem(row, 4, self._num_item(offset))
 
     def _tc_on_add(self):
         r = self.tbl_tc.rowCount()
         if r >= MAX_TC:
             return
         self.tbl_tc.insertRow(r)
-        self._tc_set_row(r, ch=r, name=f"TC{r}", typ="K", include=True)
+        self._tc_set_row(r, include=True, ch=r, name=f"TC{r}", typ="K", offset=0.0)
 
     def _tc_on_remove(self):
         r = self.tbl_tc.currentRow()
@@ -403,13 +421,20 @@ class ConfigEditorDialog(QtWidgets.QDialog):
         tc_rows = min(self.tbl_tc.rowCount(), MAX_TC)
         tc_list = []
         for r in range(tc_rows):
-            ch = self.tbl_tc.cellWidget(r, 0).value() if self.tbl_tc.cellWidget(r, 0) else r
-            name = self._safe_text(self.tbl_tc.item(r, 1), f"TC{ch}")
+            inc_it = self.tbl_tc.item(r, 0)
+            include = (inc_it.checkState() == QtCore.Qt.CheckState.Checked) if inc_it else True
+
+            ch = self.tbl_tc.cellWidget(r, 1).value() if self.tbl_tc.cellWidget(r, 1) else r
+            name = self._safe_text(self.tbl_tc.item(r, 2), f"TC{ch}")
+
             typ = "K"
-            if isinstance(self.tbl_tc.cellWidget(r, 2), QtWidgets.QComboBox):
-                typ = self.tbl_tc.cellWidget(r, 2).currentText().upper()
-            inc_it = self.tbl_tc.item(r, 3); include = (inc_it.checkState() == QtCore.Qt.CheckState.Checked) if inc_it else True
-            tc_list.append({"ch": int(ch), "name": name, "type": typ, "include": bool(include)})
+            if isinstance(self.tbl_tc.cellWidget(r, 3), QtWidgets.QComboBox):
+                typ = self.tbl_tc.cellWidget(r, 3).currentText().upper()
+
+            offset = self._safe_float(self.tbl_tc.item(r, 4), 0.0)
+
+            tc_list.append(
+                {"include": bool(include), "ch": int(ch), "name": name, "type": typ, "offset": float(offset)})
         cfg.thermocouples = tc_list
 
         return cfg

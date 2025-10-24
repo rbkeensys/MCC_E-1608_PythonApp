@@ -12,9 +12,9 @@
   },
   "analogs": [
     {
-      "name": "Voltage",
-      "slope": 1.0,
-      "offset": 0.0,
+      "name": "Pressure",
+      "slope": 250.0,
+      "offset": -123.2,
       "cutoffHz": 0.5,
       "units": "",
       "include": true
@@ -25,7 +25,7 @@
       "offset": 32.0,
       "cutoffHz": 0.005,
       "units": "",
-      "include": true
+      "include": false
     },
     {
       "name": "In Temp",
@@ -33,7 +33,7 @@
       "offset": 32.0,
       "cutoffHz": 0.1,
       "units": "",
-      "include": true
+      "include": false
     },
     {
       "name": "Pressure",
@@ -152,16 +152,25 @@
   ],
   "thermocouples": [
     {
+      "include": true,
       "ch": 0,
-      "name": "Bot Temp",
+      "name": "Air Temp",
       "type": "T",
-      "include": true
+      "offset": 0.0
     },
     {
+      "include": true,
       "ch": 1,
       "name": "Temp",
       "type": "T",
-      "include": true
+      "offset": 0.0
+    },
+    {
+      "include": true,
+      "ch": 2,
+      "name": "T Type Test",
+      "type": "T",
+      "offset": 0.0
     }
   ]
 }
