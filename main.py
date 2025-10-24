@@ -1610,7 +1610,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return [i for i, h in enumerate(hdr) if h.startswith(prefix)]
 
         # AI: names are exact analog names; pick those that match included set
-        ai_idxs = [i for i, h in enumerate(hdr) if h in [a.name for a in self.cfg.analogs if a.included]]
+        ai_idxs = [i for i, h in enumerate(hdr) if h in [a.name for a in self.cfg.analogs if a.include]]
         ai_ys = [np.array([float(v) if v != "" else np.nan for v in cols[i]]) for i in ai_idxs]
 
         tc_idxs = [i for i, h in enumerate(hdr) if h.startswith("TC")]

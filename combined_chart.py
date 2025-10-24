@@ -672,6 +672,27 @@ class _LiveReadoutDialog(QtWidgets.QDialog):
 
         self.resize(320, 480)
 
+    def showEvent(self, e):
+        # Rebuild rows (visible traces might have changed)
+        self._clear_rows()
+        # Restart the live updates every time it’s shown
+        try:
+            self._timer.start()
+        except Exception:
+            pass
+        return super().showEvent(e)
+
+    def _clear_rows(self):
+        # Keep the first row (the button bar), remove the rest
+        # QFormLayout rows: 0 = button bar we added in __init__
+        try:
+            while self._form.rowCount() > 1:
+                self._form.removeRow(1)
+        except Exception:
+            # Fallback: brute force remove all and re-add button bar
+            pass
+        self._rows = []
+
     def closeEvent(self, e):
         try: self._timer.stop()
         except: pass
