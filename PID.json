@@ -6,16 +6,17 @@
       "ai_ch": 1,
       "out_ch": 0,
       "target": 49.5,
-      "kp": -4.499999999999995,
+      "kp": -4.5,
       "ki": 0.0,
       "kd": 0.0,
       "out_min": null,
       "out_max": null,
-      "err_min": -2.9999999999999996,
-      "err_max": 2.9999999999999996,
+      "err_min": -3.0,
+      "err_max": 3.0,
       "i_min": -0.0,
       "i_max": 0.0,
-      "src": "tc"
+      "src": "tc",
+      "name": "Outlet Cntrl"
     },
     {
       "enabled": true,
@@ -23,16 +24,17 @@
       "ai_ch": 1,
       "out_ch": 0,
       "target": 50.0,
-      "kp": 0.24999999999999375,
-      "ki": 3.469446951953614e-18,
-      "kd": 8.999999999999986,
+      "kp": 0.25,
+      "ki": 3.46945e-18,
+      "kd": 9.0,
       "out_min": null,
       "out_max": null,
-      "err_min": -0.9999999999999999,
-      "err_max": 0.9999999999999999,
+      "err_min": -1.0,
+      "err_max": 1.0,
       "i_min": -0.5,
       "i_max": 0.5,
-      "src": "tc"
+      "src": "tc",
+      "name": "Inlet Cntrl"
     }
   ]
 }

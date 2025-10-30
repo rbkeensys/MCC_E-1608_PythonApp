@@ -26,6 +26,7 @@ class PIDLoopDef:
     # pid.py  (inside PIDLoopDef dataclass)
     src: str = "ai"  # "ai" or "tc"  (NEW)
 
+    name: str = ""  # Display name
 # ---------- Core ----------
 class _PIDCore:
     def __init__(self, kp: float, ki: float, kd: float, setpoint: float,
@@ -159,7 +160,7 @@ class PIDManager:
 
         allowed = {
             "enabled","kind","ai_ch","out_ch","target","kp","ki","kd",
-            "out_min","out_max","err_min","err_max","i_min","i_max","src"
+            "out_min","out_max","err_min","err_max","i_min","i_max","src","name"
         }
 
         for item in js.get("loops", []):
@@ -167,6 +168,7 @@ class PIDManager:
             d = {k: item[k] for k in allowed if k in item}
             # required fallbacks if missing
             d.setdefault("src", "ai")
+            d.setdefault("name", "")
             d.setdefault("enabled", True)
             d.setdefault("kind", "digital")
             d.setdefault("ai_ch", 0)

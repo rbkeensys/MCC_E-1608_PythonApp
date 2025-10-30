@@ -41,17 +41,11 @@ from acq_worker import AcqWorker
 from combined_chart import CombinedChartWindow
 from bisect import bisect_left
 
+
 class PIDSetupDialog(QtWidgets.QDialog):
     """
-    Editor for PID loops with:
-      - Enable
-      - Type (Digital PID / Analog PID)   [derived from output selector]
-      - Source (ai | tc)
-      - AI ch
-      - OUT (D0..D7, A0..A1)              [changes kind+out_ch]
-      - Target, P, I, D
-      - Clamps (ErrMin, ErrMax, IMin, IMax, OutMin, OutMax for analog)
-      - Add / Remove
+    Editor for PID loops.
+    Columns: Name | Enable | Type | Source | AI ch | OUT (D/A) | Target | P | I | D | ErrMin | ErrMax | IMin | IMax | OutMin/Max
     """
     def __init__(self, pid_mgr, parent=None):
         super().__init__(parent)
@@ -64,12 +58,15 @@ class PIDSetupDialog(QtWidgets.QDialog):
 
         # Table
         self.table = QtWidgets.QTableWidget(self)
-        self.table.setColumnCount(14)
+        self.table.setColumnCount(15)
         self.table.setHorizontalHeaderLabels([
-            "Enable","Type","Source","AI ch","OUT (D/A)","Target","P","I","D",
+            "Name","Enable","Type","Source","AI ch","OUT (D/A)","Target","P","I","D",
             "ErrMin","ErrMax","IMin","IMax","OutMin/Max"
         ])
-        self.table.horizontalHeader().setStretchLastSection(True)
+        hdr = self.table.horizontalHeader()
+        hdr.setStretchLastSection(False)
+        hdr.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Interactive)
+        hdr.setSectionResizeMode(14, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)  # "OutMin/Max"
         v.addWidget(self.table)
 
         # Buttons row
@@ -84,75 +81,79 @@ class PIDSetupDialog(QtWidgets.QDialog):
         hb.addWidget(self.btn_ok); hb.addWidget(self.btn_cancel)
         v.addLayout(hb)
 
+        # Fill rows from manager
+        loops = self.pid_mgr.loops
+        self.table.setRowCount(len(loops))
+        for r, lp in enumerate(loops):
+            self._fill_row(r, lp)
+
+        # Wire buttons
         self.btn_add.clicked.connect(self._on_add)
         self.btn_remove.clicked.connect(self._on_remove)
         self.btn_ok.clicked.connect(self.accept)
         self.btn_cancel.clicked.connect(self.reject)
 
-        # Fill rows from manager loops
-        self._refresh_from_mgr()
-
-    # ---------- helpers ----------
-    def _refresh_from_mgr(self):
-        loops = getattr(self.pid_mgr, "loops", [])
-        self.table.setRowCount(len(loops))
-        for r, lp in enumerate(loops):
-            self._fill_row(r, lp)
-
     def _fill_row(self, r, lp):
+        # Name (editable text)
+        it_name = QtWidgets.QTableWidgetItem(str(getattr(lp, "name", "")))
+        self.table.setItem(r, 0, it_name)
+
         # Enable
         cb_en = QtWidgets.QCheckBox()
         cb_en.setChecked(bool(getattr(lp, "enabled", True)))
         cb_en.stateChanged.connect(lambda _s, row=r: self._on_enable(row))
-        self.table.setCellWidget(r, 0, cb_en)
+        self.table.setCellWidget(r, 1, cb_en)
 
-        # Type (derived; read-only label)
-        typ = "Digital PID" if lp.kind == "digital" else "Analog PID"
-        it_typ = QtWidgets.QTableWidgetItem(typ)
-        it_typ.setFlags(it_typ.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
-        self.table.setItem(r, 1, it_typ)
+        # Type (editable)
+        cb_typ = QtWidgets.QComboBox()
+        cb_typ.addItems(["Digital PID","Analog PID"])
+        cb_typ.setCurrentIndex(0 if lp.kind=="digital" else 1)
+        cb_typ.currentIndexChanged.connect(lambda _i, row=r: self._on_type(row))
+        self.table.setCellWidget(r, 2, cb_typ)
 
         # Source (ai|tc)
         src_cb = QtWidgets.QComboBox()
         src_cb.addItems(["ai","tc"])
-        src_cb.setCurrentText(getattr(lp, "src", "ai"))
+        try: src_cb.setCurrentText(str(getattr(lp, "src", "ai")))
+        except Exception: pass
         src_cb.currentTextChanged.connect(lambda _t, row=r: self._on_src(row))
-        self.table.setCellWidget(r, 2, src_cb)
+        self.table.setCellWidget(r, 3, src_cb)
 
-        # AI channel
-        sp_ai = QtWidgets.QSpinBox(); sp_ai.setRange(0, 31); sp_ai.setValue(int(lp.ai_ch))
+        # AI ch
+        sp_ai = QtWidgets.QSpinBox()
+        sp_ai.setRange(0, 7)
+        sp_ai.setValue(int(getattr(lp, "ai_ch", 0)))
         sp_ai.valueChanged.connect(lambda _v, row=r: self._on_ai(row))
-        self.table.setCellWidget(r, 3, sp_ai)
+        self.table.setCellWidget(r, 4, sp_ai)
 
-        # OUT (D0..D7, A0..A1)
+        # OUT (D/A)
         out_combo = QtWidgets.QComboBox()
         for i in range(8): out_combo.addItem(f"D{i}")
         for i in range(2): out_combo.addItem(f"A{i}")
-        # set current based on lp.kind/out_ch
         cur = f"{'D' if lp.kind=='digital' else 'A'}{int(lp.out_ch)}"
         idx = out_combo.findText(cur)
         out_combo.setCurrentIndex(max(0, idx))
         out_combo.currentTextChanged.connect(lambda _t, row=r: self._on_out(row))
-        self.table.setCellWidget(r, 4, out_combo)
+        self.table.setCellWidget(r, 5, out_combo)
 
         # Target, P, I, D
-        for col, val in [(5, lp.target), (6, lp.kp), (7, lp.ki), (8, lp.kd)]:
+        for col, val in [(6, lp.target), (7, lp.kp), (8, lp.ki), (9, lp.kd)]:
             self.table.setItem(r, col, self._num_item(val))
 
         # ErrMin/ErrMax, IMin/IMax
-        self.table.setItem(r, 9,  self._maybe_num_item(getattr(lp, "err_min", None)))
-        self.table.setItem(r, 10, self._maybe_num_item(getattr(lp, "err_max", None)))
-        self.table.setItem(r, 11, self._maybe_num_item(getattr(lp, "i_min", None)))
-        self.table.setItem(r, 12, self._maybe_num_item(getattr(lp, "i_max", None)))
+        self.table.setItem(r, 10,  self._maybe_num_item(getattr(lp, "err_min", None)))
+        self.table.setItem(r, 11, self._maybe_num_item(getattr(lp, "err_max", None)))
+        self.table.setItem(r, 12, self._maybe_num_item(getattr(lp, "i_min", None)))
+        self.table.setItem(r, 13, self._maybe_num_item(getattr(lp, "i_max", None)))
 
-        # OutMin/Max (analog only) — show as text "lo..hi" for convenience
+        # OutMin/Max (analog only) — as "lo..hi"
         if lp.kind == "analog":
             lo = getattr(lp, "out_min", None)
             hi = getattr(lp, "out_max", None)
             txt = "" if (lo is None and hi is None) else f"{'' if lo is None else lo}..{'' if hi is None else hi}"
         else:
-            txt = ""  # not applicable to digital
-        self.table.setItem(r, 13, QtWidgets.QTableWidgetItem(txt))
+            txt = ""
+        self.table.setItem(r, 14, QtWidgets.QTableWidgetItem(txt))
 
     @staticmethod
     def _num_item(val) -> QtWidgets.QTableWidgetItem:
@@ -174,9 +175,8 @@ class PIDSetupDialog(QtWidgets.QDialog):
     def _on_add(self):
         from pid import PIDLoopDef
         loops = self.pid_mgr.loops
-        # default new as digital on DO0
         new = PIDLoopDef(kind="digital", enabled=True, src="ai",
-                         ai_ch=0, out_ch=0, target=0.0, kp=1.0, ki=0.0, kd=0.0)
+                         ai_ch=0, out_ch=0, target=0.0, kp=1.0, ki=0.0, kd=0.0, name="")
         loops.append(new)
         self.table.insertRow(self.table.rowCount())
         self._fill_row(self.table.rowCount()-1, new)
@@ -187,37 +187,57 @@ class PIDSetupDialog(QtWidgets.QDialog):
         del self.pid_mgr.loops[r]
         self.table.removeRow(r)
 
-    # ---------- cell handlers (write-through to pid_mgr.loops) ----------
+    # ---------- cell handlers ----------
     def _loop_at(self, row):
         loops = getattr(self.pid_mgr, "loops", [])
         if 0 <= row < len(loops): return loops[row]
         return None
 
     def _on_enable(self, row):
-        lp = self._loop_at(row);  lp.enabled = bool(self.table.cellWidget(row, 0).isChecked())
+        lp = self._loop_at(row);  lp.enabled = bool(self.table.cellWidget(row, 1).isChecked())
+
+    def _on_type(self, row):
+        lp = self._loop_at(row)
+        cb = self.table.cellWidget(row, 2)
+        if lp is None or cb is None: return
+        lp.kind = "digital" if cb.currentIndex() == 0 else "analog"
+        # flip OUT if inconsistent
+        out_cb = self.table.cellWidget(row, 5)
+        if isinstance(out_cb, QtWidgets.QComboBox):
+            cur = out_cb.currentText() or ""
+            want = "D" if lp.kind == "digital" else "A"
+            if not cur.startswith(want):
+                idx = out_cb.findText(f"{want}0")
+                out_cb.setCurrentIndex(max(0, idx))
+        # OutMin/Max display
+        if lp.kind == "digital":
+            self.table.setItem(row, 14, QtWidgets.QTableWidgetItem(""))
+        else:
+            lo = getattr(lp, "out_min", None); hi = getattr(lp, "out_max", None)
+            txt = "" if (lo is None and hi is None) else f"{'' if lo is None else lo}..{'' if hi is None else hi}"
+            self.table.setItem(row, 14, QtWidgets.QTableWidgetItem(txt))
 
     def _on_src(self, row):
-        lp = self._loop_at(row);  lp.src = str(self.table.cellWidget(row, 2).currentText())
+        lp = self._loop_at(row);  lp.src = str(self.table.cellWidget(row, 3).currentText())
 
     def _on_ai(self, row):
-        lp = self._loop_at(row);  lp.ai_ch = int(self.table.cellWidget(row, 3).value())
+        lp = self._loop_at(row);  lp.ai_ch = int(self.table.cellWidget(row, 4).value())
 
     def _on_out(self, row):
-        """Parse Dn/Am and update kind + out_ch + type label."""
         lp = self._loop_at(row)
-        txt = str(self.table.cellWidget(row, 4).currentText())
+        txt = str(self.table.cellWidget(row, 5).currentText())
         if txt and txt[0] in ("D","A"):
             k = "digital" if txt[0] == "D" else "analog"
             ch = int(txt[1:])
             lp.kind = k
             lp.out_ch = ch
-            # update type label column (col 1)
-            it = self.table.item(row, 1)
-            if it: it.setText("Digital PID" if k=="digital" else "Analog PID")
+            # update Type combo to match
+            cb = self.table.cellWidget(row, 2)
+            if isinstance(cb, QtWidgets.QComboBox):
+                cb.setCurrentIndex(0 if k=="digital" else 1)
 
     # ---------- collect back to pid_mgr ----------
     def accept(self):
-        # Pull scalar columns into loop defs, preserving previous values on blanks
         for r in range(self.table.rowCount()):
             lp = self._loop_at(r)
 
@@ -233,17 +253,17 @@ class PIDSetupDialog(QtWidgets.QDialog):
                 except Exception:
                     return current
 
-            lp.target = _getf(5, getattr(lp, "target", 0.0))
-            lp.kp = _getf(6, getattr(lp, "kp", 1.0))
-            lp.ki = _getf(7, getattr(lp, "ki", 0.0))
-            lp.kd = _getf(8, getattr(lp, "kd", 0.0))
-            lp.err_min = _getf(9, getattr(lp, "err_min", None))
-            lp.err_max = _getf(10, getattr(lp, "err_max", None))
-            lp.i_min = _getf(11, getattr(lp, "i_min", None))
-            lp.i_max = _getf(12, getattr(lp, "i_max", None))
+            lp.target = _getf(6, getattr(lp, "target", 0.0))
+            lp.kp = _getf(7, getattr(lp, "kp", 0.0))
+            lp.ki = _getf(8, getattr(lp, "ki", 0.0))
+            lp.kd = _getf(9, getattr(lp, "kd", 0.0))
+            lp.err_min = _getf(10, getattr(lp, "err_min", None))
+            lp.err_max = _getf(11, getattr(lp, "err_max", None))
+            lp.i_min = _getf(12, getattr(lp, "i_min", None))
+            lp.i_max = _getf(13, getattr(lp, "i_max", None))
 
-            # parse OutMin/Max "lo..hi"
-            it = self.table.item(r, 13)
+            # OutMin/Max "lo..hi"
+            it = self.table.item(r, 14)
             txt = (it.text() if it else "").strip()
             lo = getattr(lp, "out_min", None)
             hi = getattr(lp, "out_max", None)
@@ -260,8 +280,12 @@ class PIDSetupDialog(QtWidgets.QDialog):
             lp.out_min = lo
             lp.out_max = hi
 
-        super().accept()
+            # Name
+            itn = self.table.item(r, 0)
+            if itn is not None:
+                lp.name = itn.text()
 
+        super().accept()
 
 class ScaleDialog(QtWidgets.QDialog):
     def __init__(self, parent, idx, y_min, y_max):
@@ -706,7 +730,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pid_table.setColumnWidth(2, 55)  # Src (ai/tc) (narrow ~1/3)
         self.pid_table.setColumnWidth(3, 60)  # AI ch (half)
         self.pid_table.setColumnWidth(4, 60)  # OUT ch (half)
-        self.pid_table.horizontalHeader().setStretchLastSection(True)
+        hdr = self.pid_table.horizontalHeader()
+        hdr.setStretchLastSection(False)
+        hdr.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Interactive)
         rgl.addWidget(self.pid_table, 9, 0, 1, 2)
 
         self.ao_sliders=[]; self.ao_labels=[]
@@ -1945,41 +1971,49 @@ class MainWindow(QtWidgets.QMainWindow):
         loops = getattr(self.pid_mgr, "loops", [])
         self.pid_table.setRowCount(len(loops))
         self.pid_table.setColumnCount(11)
-        self.pid_table.setColumnCount(14)
+        self.pid_table.setColumnCount(15)
         self.pid_table.setHorizontalHeaderLabels([
-            "Enable", "Type", "Src", "AIch", "OUTch",
+            "Name", "Enable", "Type", "Src", "AIch", "OUTch",
             "AIValue", "Target", "PID u", "OutputValue",
             "P", "I", "D", "I limit", "Err limit"
         ])
-        self.pid_table.horizontalHeader().setStretchLastSection(True)
+        hdr = self.pid_table.horizontalHeader()
+        hdr.setStretchLastSection(False)
+        hdr.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Interactive)
+        hdr.setSectionResizeMode(14, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)  # "Err limit" (last col)
 
         for r, lp in enumerate(loops):
+            # Name (editable)
+            name_edit = QtWidgets.QLineEdit(str(getattr(lp, "name", "")))
+            name_edit.editingFinished.connect(lambda row=r, w=name_edit: self._pid_on_name_changed(row, w.text()))
+            self.pid_table.setCellWidget(r, 0, name_edit)
+
             # Enable (editable)
             cb = QtWidgets.QCheckBox()
             cb.setChecked(bool(lp.enabled))
             cb.stateChanged.connect(lambda state, row=r: self._pid_on_enable_row(row, state))
-            self.pid_table.setCellWidget(r, 0, cb)
+            self.pid_table.setCellWidget(r, 1, cb)
 
             # Type (editable)
             typ = QtWidgets.QComboBox()
             typ.addItems(["digital", "analog"])
             typ.setCurrentText(lp.kind)
             typ.currentTextChanged.connect(lambda text, row=r: self._pid_on_type_changed(row, text))
-            self.pid_table.setCellWidget(r, 1, typ)
+            self.pid_table.setCellWidget(r, 2, typ)
 
             # Src (editable: ai|tc)
             src = QtWidgets.QComboBox()
             src.addItems(["ai", "tc"])
             src.setCurrentText(getattr(lp, "src", "ai"))
             src.currentTextChanged.connect(lambda text, row=r: self._pid_on_src_changed(row, text))
-            self.pid_table.setCellWidget(r, 2, src)
+            self.pid_table.setCellWidget(r, 3, src)
 
             # AI ch (editable)
             sp_ai = QtWidgets.QSpinBox()
             sp_ai.setRange(0, 3)
             sp_ai.setValue(int(lp.ai_ch))
             sp_ai.valueChanged.connect(lambda val, row=r: self._pid_on_ai_changed(row, val))
-            self.pid_table.setCellWidget(r, 3, sp_ai)
+            self.pid_table.setCellWidget(r, 4, sp_ai)
 
             # OUT ch (editable; range depends on type)
             sp_out = QtWidgets.QSpinBox()
@@ -1989,7 +2023,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 sp_out.setRange(0, 7)
             sp_out.setValue(int(lp.out_ch))
             sp_out.valueChanged.connect(lambda val, row=r: self._pid_on_out_changed(row, val))
-            self.pid_table.setCellWidget(r, 4, sp_out)
+            self.pid_table.setCellWidget(r, 5, sp_out)
 
             # AIValue (read-only)
             it = QtWidgets.QTableWidgetItem("—");
@@ -2016,7 +2050,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.pid_table.setItem(r, 7, it)
 
             # P/I/D (editable)
-            for c, key in enumerate(["kp", "ki", "kd"], start=9):
+            for c, key in enumerate(["kp", "ki", "kd"], start=10):
                 dsp = QtWidgets.QDoubleSpinBox()
                 dsp.setDecimals(6);
                 dsp.setRange(-1e6, 1e6);
@@ -2035,7 +2069,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 cur_i = max(abs(float(lp.i_min)), abs(float(lp.i_max)))
             dsp_i_abs.setValue(cur_i)
             dsp_i_abs.valueChanged.connect(lambda val, row=r: self._pid_on_i_abs_changed(row, val))
-            self.pid_table.setCellWidget(r, 12, dsp_i_abs)
+            self.pid_table.setCellWidget(r, 13, dsp_i_abs)
 
             # Error limit (abs) — mirrors err_min/err_max symmetrically
             dsp_err_abs = QtWidgets.QDoubleSpinBox()
@@ -2047,7 +2081,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 cur_e = max(abs(float(lp.err_min)), abs(float(lp.err_max)))
             dsp_err_abs.setValue(cur_e)
             dsp_err_abs.valueChanged.connect(lambda val, row=r: self._pid_on_err_abs_changed(row, val))
-            self.pid_table.setCellWidget(r, 13, dsp_err_abs)
+            self.pid_table.setCellWidget(r, 14, dsp_err_abs)
+
+            # Name already placed at column 0
 
     def _pid_update_table_values(self):
         # Build a quick lookup of runtime objects by (kind, ai, out)
@@ -2098,7 +2134,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     else:
                         out_val = "—"
 
-            for col, txt in [(5, ai_val), (7, pid_val), (8, out_val)]:
+            for col, txt in [(6, ai_val), (8, pid_val), (9, out_val)]:
                 it = self.pid_table.item(r, col)
                 if it is None:
                     it = QtWidgets.QTableWidgetItem()
@@ -2123,7 +2159,7 @@ def _pid_on_type_changed(self, row, text):
     try:
         self.pid_mgr.loops[row].kind = text
         # adjust OUT range for this row
-        w = self.pid_table.cellWidget(row, 4)
+        w = self.pid_table.cellWidget(row, 5)
         if isinstance(w, QtWidgets.QSpinBox):
             if text == "analog":
                 w.setRange(0, 1)

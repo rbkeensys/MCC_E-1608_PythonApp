@@ -20,12 +20,12 @@
       "include": true
     },
     {
-      "name": "Out Temp",
-      "slope": 22.0,
-      "offset": 32.0,
-      "cutoffHz": 0.005,
+      "name": "Valve FB",
+      "slope": 1.0,
+      "offset": 0.0,
+      "cutoffHz": 2.0,
       "units": "",
-      "include": false
+      "include": true
     },
     {
       "name": "In Temp",
@@ -78,25 +78,25 @@
   ],
   "digitalOutputs": [
     {
-      "name": "Heater1",
+      "name": "Inlet Valve",
       "normallyOpen": false,
       "momentary": false,
       "actuationTime": 0.0,
       "include": true
     },
     {
-      "name": "Valve N2",
+      "name": "Outlet Valve",
       "normallyOpen": false,
       "momentary": false,
       "actuationTime": 0.0,
       "include": true
     },
     {
-      "name": "D2",
+      "name": "Heater",
       "normallyOpen": false,
       "momentary": false,
       "actuationTime": 0.0,
-      "include": false
+      "include": true
     },
     {
       "name": "D3",
@@ -137,7 +137,7 @@
   "analogOutputs": [
     {
       "name": "AO0",
-      "minV": 1.0,
+      "minV": 0.8,
       "maxV": 10.0,
       "startupV": 0.0,
       "include": true
@@ -154,21 +154,28 @@
     {
       "include": true,
       "ch": 0,
-      "name": "Air Temp",
+      "name": "Top Temp",
       "type": "T",
       "offset": 0.0
     },
     {
       "include": true,
       "ch": 1,
-      "name": "Temp",
+      "name": "Mid High",
       "type": "T",
       "offset": 0.0
     },
     {
       "include": true,
       "ch": 2,
-      "name": "T Type Test",
+      "name": "Mid Low",
+      "type": "T",
+      "offset": 0.0
+    },
+    {
+      "include": true,
+      "ch": 3,
+      "name": "Bottom",
       "type": "T",
       "offset": 0.0
     }
